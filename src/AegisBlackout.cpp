@@ -11,6 +11,7 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <bcrypt.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <algorithm>
@@ -181,6 +182,7 @@ static int  g_cloakedCount = 0;
 static HWND g_failedHwnds[MAX_FAILED_HWNDS];
 static int  g_failedCount = 0;
 static PFN_NtQueueApcThreadEx2 g_pNtQueueApcThreadEx2 = NULL;
+static HMODULE                 g_hWin32uLocal         = NULL;
 static PVOID                   g_pNtUserSetWDA        = NULL;
 static PFN_IsWow64Process2     g_pIsWow64Process2     = NULL;
 static BOOL      g_bPerWndCloakReady = FALSE;
@@ -191,11 +193,37 @@ static void InitPerWindowCloak(void)
 {
     HMODULE hNt   = GetModuleHandleW(L"ntdll.dll");
     HMODULE hK32  = GetModuleHandleW(L"kernel32.dll");
-    HMODULE hW32u = LoadLibraryW(L"win32u.dll");
-    if (hNt)   g_pNtQueueApcThreadEx2 = (PFN_NtQueueApcThreadEx2)GetProcAddress(hNt, "NtQueueApcThreadEx2");
-    if (hW32u) g_pNtUserSetWDA        = (PVOID)GetProcAddress(hW32u, "NtUserSetWindowDisplayAffinity");
-    if (hK32)  g_pIsWow64Process2     = (PFN_IsWow64Process2)GetProcAddress(hK32, "IsWow64Process2");
-    g_bPerWndCloakReady = (g_pNtQueueApcThreadEx2 != NULL && g_pNtUserSetWDA != NULL && g_pIsWow64Process2 != NULL);
+    g_hWin32uLocal = LoadLibraryW(L"win32u.dll");
+    if (hNt)            g_pNtQueueApcThreadEx2 = (PFN_NtQueueApcThreadEx2)GetProcAddress(hNt, "NtQueueApcThreadEx2");
+    if (g_hWin32uLocal) g_pNtUserSetWDA        = (PVOID)GetProcAddress(g_hWin32uLocal, "NtUserSetWindowDisplayAffinity");
+    if (hK32)           g_pIsWow64Process2     = (PFN_IsWow64Process2)GetProcAddress(hK32, "IsWow64Process2");
+    g_bPerWndCloakReady = (g_pNtQueueApcThreadEx2 != NULL && g_hWin32uLocal != NULL && g_pNtUserSetWDA != NULL && g_pIsWow64Process2 != NULL);
+}
+
+static BOOL VerifyWin32uMappedAtSameBase(DWORD pid)
+{
+    if (!g_hWin32uLocal || !g_pNtUserSetWDA) return FALSE;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    if (snap == INVALID_HANDLE_VALUE) return FALSE;
+
+    BOOL matched = FALSE;
+    MODULEENTRY32W me = { 0 };
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(snap, &me)) {
+        do {
+            if (_wcsicmp(me.szModule, L"win32u.dll") == 0) {
+                const BYTE* targetAddr = (const BYTE*)g_pNtUserSetWDA;
+                if (me.modBaseAddr == (BYTE*)g_hWin32uLocal &&
+                    targetAddr >= me.modBaseAddr &&
+                    targetAddr < (me.modBaseAddr + me.modBaseSize)) {
+                    matched = TRUE;
+                }
+                break;
+            }
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    return matched;
 }
 
 static BOOL QueueWindowAffinityApc(HWND hwnd, DWORD tid, DWORD targetAff)
@@ -286,7 +314,7 @@ static BOOL IsSafeTargetWindow(HWND hwnd, DWORD* outPid, DWORD* outTid)
         L"Windows.UI.Core.CoreWindow", L"NotifyIconOverflowWindow",
         L"TaskListThumbnailWnd", L"MultitaskingViewFrame", L"Xaml_WindowedPopupClass",
         L"ForegroundStaging", L"EdgeUiInputTopWndClass", L"ImmersiveLauncher",
-        L"LivePreview", L"tooltips_class32"
+        L"LivePreview", L"tooltips_class32", L"ConsoleWindowClass"
     };
     for (size_t i = 0; i < sizeof(skipClasses) / sizeof(skipClasses[0]); i++) {
         if (_wcsicmp(cls, skipClasses[i]) == 0) return FALSE;
@@ -318,12 +346,15 @@ static BOOL IsSafeTargetWindow(HWND hwnd, DWORD* outPid, DWORD* outTid)
         L"STARTMENUEXPERIENCEHOST.EXE", L"SEARCHHOST.EXE", L"TEXTINPUTHOST.EXE",
         L"SHELLEXPERIENCEHOST.EXE", L"LOCKAPP.EXE", L"SCREENCLIPPINGHOST.EXE",
         L"SNIPPINGTOOL.EXE", L"MSMPENG.EXE", L"SECURITYHEALTHSYSTRAY.EXE",
-        L"TASKMGR.EXE", L"SBIE", L"SANDMAN.EXE", L"EASYANTICHEAT", L"BATTLEYE",
+        L"TASKMGR.EXE", L"CMD.EXE", L"CONHOST.EXE",
+        L"SBIE", L"SANDMAN.EXE", L"EASYANTICHEAT", L"BATTLEYE",
         L"VGC.EXE", L"GAMEGUARD", L"\\STEAMLIBRARY\\", L"STEAM.EXE", L"EPICGAMESLAUNCHER.EXE"
     };
     for (size_t i = 0; i < sizeof(skipImages) / sizeof(skipImages[0]); i++) {
         if (wcsstr(img, skipImages[i])) return FALSE;
     }
+
+    if (!VerifyWin32uMappedAtSameBase(pid)) return FALSE;
 
     *outPid = pid;
     *outTid = tid;
@@ -1389,7 +1420,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_hInst = hInst;
 
-    StartupLog("AegisBlackout v4.0 startup begin (DPI Aware v2, 24x7 HwDRM + PerWnd Special-APC + Zero-Silent, Ctrl+Alt+Q)", TRUE);
+    StartupLog("AegisBlackout v4.0.1 startup begin (DPI Aware v2, 24x7 HwDRM + PerWnd Special-APC + Zero-Silent, Ctrl+Alt+Q)", TRUE);
 
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\DwmCompHelper_Mtx_a9e1");
     if (!hMutex || GetLastError() == ERROR_ALREADY_EXISTS) {

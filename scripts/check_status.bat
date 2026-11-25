@@ -8,7 +8,7 @@ if not exist "%BIN_DIR%\aegis_init.log" if exist "%BASE_DIR%\..\build\aegis_init
 )
 
 echo ====================================================================
-echo   AegisBlackout v4.0.0 - Runtime Status Check
+echo   AegisBlackout v4.0.1 - Runtime Status Check
 echo ====================================================================
 echo.
 
