@@ -28,7 +28,7 @@ if not exist "%BIN_DIR%\AegisBlackoutSvc.exe" (
 )
 
 echo ====================================================================
-echo   AegisBlackout v3.0.0 - Kernel UIPI + SYSTEM Watchdog Installer
+echo   AegisBlackout v4.0.0 - Kernel UIPI + Per-Window Cloak + Watchdog Installer
 echo ====================================================================
 echo   Binary Directory: "%BIN_DIR%"
 echo.
@@ -67,7 +67,7 @@ tasklist /fi "imagename eq AegisBlackout.exe" 2>nul | findstr /i "AegisBlackout.
 if errorlevel 1 (
     echo  [WARN] AegisBlackout.exe was not detected in tasklist yet.
 ) else (
-    echo  [OK] AegisBlackout.exe is active ^(High-IL UIPI + 24x7 GPU HW-DRM^).
+    echo  [OK] AegisBlackout.exe is active ^(High-IL UIPI + 24x7 GPU HW-DRM + Per-Wnd Cloak^).
 )
 
 echo.

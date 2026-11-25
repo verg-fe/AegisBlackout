@@ -62,6 +62,22 @@
 #define WM_APP_RESTORE_CURTAIN (WM_APP + 1)
 #define TIMER_WATCHDOG_ID      1
 #define TIMER_HWDRM_HEARTBEAT  2
+#define TIMER_CLOAK_SWEEP_ID   3
+#ifndef QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC
+#define QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC 0x00000001
+#endif
+
+typedef LONG NTSTATUS_AEGIS;
+typedef NTSTATUS_AEGIS(NTAPI* PFN_NtQueueApcThreadEx2)(
+    HANDLE ThreadHandle,
+    HANDLE ReserveHandle,
+    ULONG  ApcFlags,
+    PVOID  ApcRoutine,
+    PVOID  ApcArgument1,
+    PVOID  ApcArgument2,
+    PVOID  ApcArgument3
+);
+typedef BOOL(WINAPI* PFN_IsWow64Process2)(HANDLE, USHORT*, USHORT*);
 
 /* Startup-only diagnostic logger (never writes during runtime screenshot events) */
 static void StartupLog(const char* line, BOOL overwrite)
@@ -150,6 +166,298 @@ struct DevCacheEntry {
 };
 static DevCacheEntry g_devCache[MAX_DEV_CACHE];
 static int g_devCacheCount = 0;
+
+/* v4 Zero-Injection Per-Window Special-APC Cloak state */
+#define MAX_CLOAKED_HWNDS 256
+#define MAX_FAILED_HWNDS  128
+struct CloakedEntry {
+    HWND  hwnd;
+    DWORD pid;
+    DWORD tid;
+    DWORD appliedAff;
+};
+static CloakedEntry g_cloaked[MAX_CLOAKED_HWNDS];
+static int  g_cloakedCount = 0;
+static HWND g_failedHwnds[MAX_FAILED_HWNDS];
+static int  g_failedCount = 0;
+static PFN_NtQueueApcThreadEx2 g_pNtQueueApcThreadEx2 = NULL;
+static PVOID                   g_pNtUserSetWDA        = NULL;
+static PFN_IsWow64Process2     g_pIsWow64Process2     = NULL;
+static BOOL      g_bPerWndCloakReady = FALSE;
+static BOOL      g_bCloakSweeping    = FALSE;
+static ULONGLONG g_lastWinEventSweep = 0;
+
+static void InitPerWindowCloak(void)
+{
+    HMODULE hNt   = GetModuleHandleW(L"ntdll.dll");
+    HMODULE hK32  = GetModuleHandleW(L"kernel32.dll");
+    HMODULE hW32u = LoadLibraryW(L"win32u.dll");
+    if (hNt)   g_pNtQueueApcThreadEx2 = (PFN_NtQueueApcThreadEx2)GetProcAddress(hNt, "NtQueueApcThreadEx2");
+    if (hW32u) g_pNtUserSetWDA        = (PVOID)GetProcAddress(hW32u, "NtUserSetWindowDisplayAffinity");
+    if (hK32)  g_pIsWow64Process2     = (PFN_IsWow64Process2)GetProcAddress(hK32, "IsWow64Process2");
+    g_bPerWndCloakReady = (g_pNtQueueApcThreadEx2 != NULL && g_pNtUserSetWDA != NULL && g_pIsWow64Process2 != NULL);
+}
+
+static BOOL QueueWindowAffinityApc(HWND hwnd, DWORD tid, DWORD targetAff)
+{
+    if (!g_bPerWndCloakReady || !hwnd || tid == 0) return FALSE;
+    HANDLE hThread = OpenThread(THREAD_SET_CONTEXT, FALSE, tid);
+    if (!hThread) return FALSE;
+    NTSTATUS_AEGIS st = g_pNtQueueApcThreadEx2(
+        hThread,
+        NULL,
+        QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC,
+        g_pNtUserSetWDA,
+        (PVOID)hwnd,
+        (PVOID)(ULONG_PTR)targetAff,
+        NULL
+    );
+    CloseHandle(hThread);
+    if (st == 0) {
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL IsKnownCloaked(HWND hwnd)
+{
+    for (int i = 0; i < g_cloakedCount; i++) {
+        if (g_cloaked[i].hwnd == hwnd) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL IsFailedHwnd(HWND hwnd)
+{
+    for (int i = 0; i < g_failedCount; i++) {
+        if (g_failedHwnds[i] == hwnd) return TRUE;
+    }
+    return FALSE;
+}
+
+static void RecordFailedHwnd(HWND hwnd)
+{
+    if (IsFailedHwnd(hwnd)) return;
+    if (g_failedCount < MAX_FAILED_HWNDS) {
+        g_failedHwnds[g_failedCount++] = hwnd;
+    }
+}
+
+static void RecordCloakedHwnd(HWND hwnd, DWORD pid, DWORD tid, DWORD aff)
+{
+    for (int i = 0; i < g_cloakedCount; i++) {
+        if (g_cloaked[i].hwnd == hwnd) {
+            g_cloaked[i].pid = pid;
+            g_cloaked[i].tid = tid;
+            g_cloaked[i].appliedAff = aff;
+            return;
+        }
+    }
+    if (g_cloakedCount < MAX_CLOAKED_HWNDS) {
+        g_cloaked[g_cloakedCount].hwnd = hwnd;
+        g_cloaked[g_cloakedCount].pid  = pid;
+        g_cloaked[g_cloakedCount].tid  = tid;
+        g_cloaked[g_cloakedCount].appliedAff = aff;
+        g_cloakedCount++;
+    }
+}
+
+static BOOL IsSafeTargetWindow(HWND hwnd, DWORD* outPid, DWORD* outTid)
+{
+    if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return FALSE;
+    if (hwnd == g_hCurtain || hwnd == g_hCanvasWnd || hwnd == g_hInputWnd) return FALSE;
+    if (GetAncestor(hwnd, GA_ROOT) != hwnd) return FALSE;
+
+    RECT rc = { 0 };
+    if (!GetWindowRect(hwnd, &rc)) return FALSE;
+    if ((rc.right - rc.left) < 100 || (rc.bottom - rc.top) < 80) return FALSE;
+
+    DWORD pid = 0;
+    DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
+    if (pid <= 4 || pid == GetCurrentProcessId() || tid == 0) return FALSE;
+
+    WCHAR cls[128] = L"";
+    GetClassNameW(hwnd, cls, 127);
+    if (wcsncmp(cls, L"Sandbox:", 8) == 0) return FALSE;
+
+    static const wchar_t* skipClasses[] = {
+        L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd",
+        L"Windows.UI.Core.CoreWindow", L"NotifyIconOverflowWindow",
+        L"TaskListThumbnailWnd", L"MultitaskingViewFrame", L"Xaml_WindowedPopupClass",
+        L"ForegroundStaging", L"EdgeUiInputTopWndClass", L"ImmersiveLauncher",
+        L"LivePreview", L"tooltips_class32"
+    };
+    for (size_t i = 0; i < sizeof(skipClasses) / sizeof(skipClasses[0]); i++) {
+        if (_wcsicmp(cls, skipClasses[i]) == 0) return FALSE;
+    }
+
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) return FALSE;
+
+    USHORT procMach = 0, nativeMach = 0;
+    BOOL wowOk = g_pIsWow64Process2 && g_pIsWow64Process2(hProc, &procMach, &nativeMach);
+    if (!wowOk || procMach != IMAGE_FILE_MACHINE_UNKNOWN) {
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    WCHAR img[MAX_PATH] = L"";
+    DWORD imgLen = MAX_PATH;
+    BOOL hasImg = QueryFullProcessImageNameW(hProc, 0, img, &imgLen);
+    CloseHandle(hProc);
+    if (!hasImg) return FALSE;
+
+    for (WCHAR* p = img; *p; ++p) {
+        if (*p >= L'a' && *p <= L'z') *p = (WCHAR)(*p - L'a' + L'A');
+    }
+
+    static const wchar_t* skipImages[] = {
+        L"CSRSS.EXE", L"DWM.EXE", L"WINLOGON.EXE", L"LSASS.EXE", L"SMSS.EXE",
+        L"SERVICES.EXE", L"SVCHOST.EXE", L"SIHOST.EXE", L"CTFMON.EXE",
+        L"STARTMENUEXPERIENCEHOST.EXE", L"SEARCHHOST.EXE", L"TEXTINPUTHOST.EXE",
+        L"SHELLEXPERIENCEHOST.EXE", L"LOCKAPP.EXE", L"SCREENCLIPPINGHOST.EXE",
+        L"SNIPPINGTOOL.EXE", L"MSMPENG.EXE", L"SECURITYHEALTHSYSTRAY.EXE",
+        L"TASKMGR.EXE", L"SBIE", L"SANDMAN.EXE", L"EASYANTICHEAT", L"BATTLEYE",
+        L"VGC.EXE", L"GAMEGUARD", L"\\STEAMLIBRARY\\", L"STEAM.EXE", L"EPICGAMESLAUNCHER.EXE"
+    };
+    for (size_t i = 0; i < sizeof(skipImages) / sizeof(skipImages[0]); i++) {
+        if (wcsstr(img, skipImages[i])) return FALSE;
+    }
+
+    *outPid = pid;
+    *outTid = tid;
+    return TRUE;
+}
+
+static void SweepAndCloakWindows(void)
+{
+    if (!g_bPerWndCloakReady || g_bInternalUnmasking || g_bCloakSweeping) return;
+    g_bCloakSweeping = TRUE;
+
+    /* Prune closed handles */
+    int w = 0;
+    for (int i = 0; i < g_cloakedCount; i++) {
+        if (IsWindow(g_cloaked[i].hwnd)) g_cloaked[w++] = g_cloaked[i];
+    }
+    g_cloakedCount = w;
+
+    int fw = 0;
+    for (int i = 0; i < g_failedCount; i++) {
+        if (IsWindow(g_failedHwnds[i])) g_failedHwnds[fw++] = g_failedHwnds[i];
+    }
+    g_failedCount = fw;
+
+    struct Cand { HWND hwnd; DWORD pid; DWORD tid; };
+    struct SweepCtx {
+        Cand newCands[64];
+        int  newCount;
+    } ctx = {};
+
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        SweepCtx* c = (SweepCtx*)lp;
+        if (IsKnownCloaked(hwnd)) {
+            DWORD aff = 0;
+            if (GetWindowDisplayAffinity(hwnd, &aff) && aff == 0) {
+                DWORD pid = 0; DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
+                if (tid) QueueWindowAffinityApc(hwnd, tid, WDA_EXCLUDEFROMCAPTURE);
+            }
+            return TRUE;
+        }
+        if (IsFailedHwnd(hwnd)) return TRUE;
+
+        DWORD pid = 0, tid = 0;
+        if (!IsSafeTargetWindow(hwnd, &pid, &tid)) return TRUE;
+
+        DWORD aff = 0;
+        if (!GetWindowDisplayAffinity(hwnd, &aff) || aff != 0) return TRUE;
+
+        if (QueueWindowAffinityApc(hwnd, tid, WDA_EXCLUDEFROMCAPTURE)) {
+            if (c->newCount < 64) {
+                c->newCands[c->newCount].hwnd = hwnd;
+                c->newCands[c->newCount].pid  = pid;
+                c->newCands[c->newCount].tid  = tid;
+                c->newCount++;
+            }
+        } else {
+            RecordFailedHwnd(hwnd);
+        }
+        return TRUE;
+    }, (LPARAM)&ctx);
+
+    if (ctx.newCount > 0) {
+        Sleep(20);
+        BOOL anyFallback = FALSE;
+        for (int i = 0; i < ctx.newCount; i++) {
+            DWORD aff = 0;
+            if (GetWindowDisplayAffinity(ctx.newCands[i].hwnd, &aff) && aff == WDA_EXCLUDEFROMCAPTURE) {
+                RecordCloakedHwnd(ctx.newCands[i].hwnd, ctx.newCands[i].pid, ctx.newCands[i].tid, WDA_EXCLUDEFROMCAPTURE);
+            } else if (QueueWindowAffinityApc(ctx.newCands[i].hwnd, ctx.newCands[i].tid, WDA_MONITOR)) {
+                anyFallback = TRUE;
+            } else {
+                RecordFailedHwnd(ctx.newCands[i].hwnd);
+            }
+        }
+        if (anyFallback) {
+            Sleep(20);
+            for (int i = 0; i < ctx.newCount; i++) {
+                if (IsKnownCloaked(ctx.newCands[i].hwnd)) continue;
+                DWORD aff = 0;
+                if (GetWindowDisplayAffinity(ctx.newCands[i].hwnd, &aff) && aff != 0) {
+                    RecordCloakedHwnd(ctx.newCands[i].hwnd, ctx.newCands[i].pid, ctx.newCands[i].tid, aff);
+                } else {
+                    RecordFailedHwnd(ctx.newCands[i].hwnd);
+                }
+            }
+        }
+    }
+
+    g_bCloakSweeping = FALSE;
+}
+
+static void RestoreAllCloakedWindows(BOOL permanent)
+{
+    if (!g_bPerWndCloakReady || g_cloakedCount == 0) {
+        if (permanent) g_cloakedCount = 0;
+        return;
+    }
+    BOOL queuedAny = FALSE;
+    for (int i = 0; i < g_cloakedCount; i++) {
+        if (IsWindow(g_cloaked[i].hwnd)) {
+            if (QueueWindowAffinityApc(g_cloaked[i].hwnd, g_cloaked[i].tid, WDA_NONE)) {
+                queuedAny = TRUE;
+            }
+        }
+    }
+    if (queuedAny) {
+        ULONGLONG t0 = GetTickCount64();
+        while ((GetTickCount64() - t0) < 45) {
+            BOOL anyLeft = FALSE;
+            for (int i = 0; i < g_cloakedCount; i++) {
+                if (IsWindow(g_cloaked[i].hwnd) && IsWindowVisible(g_cloaked[i].hwnd)) {
+                    DWORD aff = 0;
+                    if (GetWindowDisplayAffinity(g_cloaked[i].hwnd, &aff) && aff != 0) {
+                        anyLeft = TRUE;
+                        break;
+                    }
+                }
+            }
+            if (!anyLeft) break;
+            Sleep(5);
+        }
+    }
+    if (permanent) g_cloakedCount = 0;
+}
+
+static void ReapplyAllCloakedWindows(void)
+{
+    if (!g_bPerWndCloakReady) return;
+    for (int i = 0; i < g_cloakedCount; i++) {
+        if (IsWindow(g_cloaked[i].hwnd)) {
+            QueueWindowAffinityApc(g_cloaked[i].hwnd, g_cloaked[i].tid, g_cloaked[i].appliedAff);
+        }
+    }
+}
 
 static void RefreshVirtualScreenBounds(void)
 {
@@ -463,6 +771,13 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd,
         (event == EVENT_OBJECT_SHOW && (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST))) {
         EnsureCurtainIntegrity();
     }
+    if (event == EVENT_SYSTEM_FOREGROUND || event == EVENT_OBJECT_SHOW) {
+        ULONGLONG now = GetTickCount64();
+        if ((now - g_lastWinEventSweep) >= 150) {
+            g_lastWinEventSweep = now;
+            SweepAndCloakWindows();
+        }
+    }
 }
 
 static RECT GetNormalizedRect(POINT p1, POINT p2)
@@ -507,6 +822,7 @@ static BOOL TakePrivilegedSnapshot(void)
 
     /* Ultra-tight internal unmask window bounded strictly by DwmFlush() */
     g_bInternalUnmasking = TRUE;
+    RestoreAllCloakedWindows(FALSE);
     if (g_bHwDrmActive && g_pDCompVisual && g_pDCompDev) {
         g_pDCompVisual->SetContent(nullptr);
         g_pDCompDev->Commit();
@@ -517,7 +833,8 @@ static BOOL TakePrivilegedSnapshot(void)
 
     BitBlt(g_hdcPristine, 0, 0, g_vw, g_vh, hdcScreen, g_vx, g_vy, SRCCOPY | CAPTUREBLT);
 
-    /* Immediately restore HW-DRM + WDA_MONITOR BEFORE building preview buffer */
+    /* Immediately restore HW-DRM + WDA_MONITOR + Per-Window Cloaks BEFORE building preview buffer */
+    ReapplyAllCloakedWindows();
     if (g_bHwDrmActive && g_pDCompVisual && g_pDCompDev && g_pSwapChain) {
         PresentHwDrmFrame();
         g_pDCompVisual->SetContent(g_pSwapChain);
@@ -897,11 +1214,14 @@ static void ShowSnippingCanvas(void)
 
 static void CleanShutdown(UINT exitCode)
 {
+    g_bInternalUnmasking = TRUE;
+    RestoreAllCloakedWindows(TRUE);
     if (g_hWinEventFg)   { UnhookWinEvent(g_hWinEventFg);   g_hWinEventFg = NULL; }
     if (g_hWinEventShow) { UnhookWinEvent(g_hWinEventShow); g_hWinEventShow = NULL; }
     if (g_hCurtain) {
         KillTimer(g_hCurtain, TIMER_WATCHDOG_ID);
         KillTimer(g_hCurtain, TIMER_HWDRM_HEARTBEAT);
+        KillTimer(g_hCurtain, TIMER_CLOAK_SWEEP_ID);
     }
     ReleaseHwDrmOverlay();
     ReleaseAndScrubSnapshots();
@@ -1054,6 +1374,8 @@ LRESULT CALLBACK CurtainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_bHwDrmActive && !g_bInternalUnmasking) {
                 PresentHwDrmFrame();
             }
+        } else if (wParam == TIMER_CLOAK_SWEEP_ID) {
+            SweepAndCloakWindows();
         }
         return 0;
     }
@@ -1067,7 +1389,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_hInst = hInst;
 
-    StartupLog("AegisBlackout v3.0 startup begin (DPI Aware v2, 24x7 HwDRM + Zero-Silent, Ctrl+Alt+Q)", TRUE);
+    StartupLog("AegisBlackout v4.0 startup begin (DPI Aware v2, 24x7 HwDRM + PerWnd Special-APC + Zero-Silent, Ctrl+Alt+Q)", TRUE);
 
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\DwmCompHelper_Mtx_a9e1");
     if (!hMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -1171,8 +1493,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
         rawOk = RegisterRawInputDevices(rids, 2, sizeof(RAWINPUTDEVICE));
     }
 
-    /* 3. Active Topmost Watchdog (100ms) + 24x7 HW-DRM Present Heartbeat (1000ms) */
+    /* 3. Active Topmost Watchdog (100ms) + 24x7 HW-DRM Heartbeat (1000ms) + Per-Window Special-APC Cloak (500ms) */
+    InitPerWindowCloak();
+    SweepAndCloakWindows();
     SetTimer(g_hCurtain, TIMER_WATCHDOG_ID, 100, NULL);
+    SetTimer(g_hCurtain, TIMER_CLOAK_SWEEP_ID, 500, NULL);
     if (g_bHwDrmActive) {
         SetTimer(g_hCurtain, TIMER_HWDRM_HEARTBEAT, 1000, NULL);
     }
@@ -1184,6 +1509,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
         EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
         NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT
     );
+
+    char cloakLog[160];
+    sprintf_s(cloakLog, sizeof(cloakLog),
+        "PerWndCloak: active=%d apcReady=%d cloaked=%d targetAff=0x%X",
+        (g_bPerWndCloakReady && g_cloakedCount > 0) ? 1 : 0,
+        g_bPerWndCloakReady ? 1 : 0,
+        g_cloakedCount,
+        (unsigned)WDA_EXCLUDEFROMCAPTURE);
+    StartupLog(cloakLog, FALSE);
 
     char summary[160];
     sprintf_s(summary, sizeof(summary),
