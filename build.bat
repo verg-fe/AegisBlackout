@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 echo ====================================================================
-echo   AegisBlackout v4.0.1 - x64 MSVC Static Build
+echo   AegisBlackout v4.0.2 - x64 MSVC Static Build
 echo ====================================================================
 
 set "VCVARS="

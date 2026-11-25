@@ -1,10 +1,10 @@
-# AegisBlackout (黑幕神盾) v4.0.1
+# AegisBlackout (黑幕神盾) v4.0.2
 
 **Windows 11 24×7 GPU 硬件 DRM (`HW_PROTECTED | DISPLAY_ONLY`) + 零注入 Special-APC 单窗隐身 (`WDA_EXCLUDEFROMCAPTURE`) + `WDA_MONITOR` + Ring-0 UIPI (`High-IL`) + `SYSTEM` 自愈守护反截屏与反录屏护盾**
 
 > **Zero Custom `.sys` Driver | Zero DLL Injection | VBS / HVCI & ACG / CFG Compatible | Zero Hotkey Occupation (`RegisterHotKey = 0`) | Zero-Silent Physical Hardware Snipping**
 
-AegisBlackout 是一个面向 Windows 11 的零内核驱动、零 DLL 注入隐私防窥与防录屏框架。**v4.0.1 在 24×7 GPU 硬件受保护显示叠加层、全屏 DWM 遮罩与 `High-IL` UIPI 隔离的基础上，内置基于 `NtQueueApcThreadEx2` (`QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC`) + 原生 `win32u!NtUserSetWindowDisplayAffinity` 的“零注入单窗隐身引擎”**（在排程前使用 `CreateToolhelp32Snapshot(TH32CS_SNAPMODULE)` 严格校验目标进程确已将 `win32u.dll` 映射在相同基址并排除 `ConsoleWindowClass` 控制台宿主）：无需任何 `VirtualAllocEx`、`WriteProcessMemory`、`CreateRemoteThread` 或 DLL 注入，即可在 16ms 内为宿主机运行中的原生 x64 应用（含启用了 ACG/CIG/CFG 的 Chromium 系浏览器与桌面应用）动态施加 `WDA_EXCLUDEFROMCAPTURE` 保护，从而在**不依赖沙箱的纯宿主机环境下**将定向单窗抓拍（`PrintWindow(PW_RENDERFULLCONTENT)` 与 `WGC CreateForWindow`）的像素泄漏压制至 `0.00%`（仅 DWM 非客户区 1px 阴影边框 `~0.4%`，正文 0 像素）。
+AegisBlackout 是一个面向 Windows 11 的零内核驱动、零 DLL 注入隐私防窥与防录屏框架。**v4.0.2 在 24×7 GPU 硬件受保护显示叠加层、全屏 DWM 遮罩与 `High-IL` UIPI 隔离的基础上，进一步强化了基于 `NtQueueApcThreadEx2` (`QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC`) + 原生 `win32u!NtUserSetWindowDisplayAffinity` 的“零注入单窗隐身引擎”**：在排程前使用 `CreateToolhelp32Snapshot(TH32CS_SNAPMODULE)` 严格校验 `win32u.dll` 基址并排除 `ConsoleWindowClass` 控制台宿主；采用 **最小边 `>=16px` 且面积 `>=1024px²`** 面积门限全面封堵单边细长条与迷你窗豁免；通过非阻塞 `EVENT_OBJECT_LOCATIONCHANGE` 监听与无全局防抖单窗快路径将放大 TOCTOU 与高频弹窗竞态压制至 `~15ms` 级，配合 `200ms` 巡检及服务重启自动认领机制，在**不依赖沙箱的纯宿主机环境下**将定向单窗抓拍（`PrintWindow(PW_RENDERFULLCONTENT)` 与 `WGC CreateForWindow`）像素泄漏压制至 `0.00%`（仅 DWM 非客户区 1px 阴影边框 `~0.4%`，正文 0 像素）。
 
 ---
 
@@ -84,7 +84,7 @@ AegisBlackout 是一个面向 Windows 11 的零内核驱动、零 DLL 注入隐�
 ## 快速上手 (Quick Start)
 
 ### 方式 A：直接下载预编译 Release（推荐）
-1. 前往 [**GitHub Releases**](../../releases/latest) 下载 `AegisBlackout-v4.0.1-win64.zip` 并解压到独立目录（例如 `C:\Program Files\AegisBlackout\`，建议目录本身仅限管理员写入）。
+1. 前往 [**GitHub Releases**](../../releases/latest) 下载 `AegisBlackout-v4.0.2-win64.zip` 并解压到独立目录（例如 `C:\Program Files\AegisBlackout\`，建议目录本身仅限管理员写入）。
 2. 验证校验和（可选）：核对 `SHA256SUMS.txt`。
 3. 右键管理员运行（或直接双击触发 UAC 提权）**`install_service.bat`**：
    - 自动锁定 `AegisBlackout.exe` / `AegisBlackoutSvc.exe` 为 NTFS 只读权限；
