@@ -11,6 +11,26 @@ AegisBlackout 是一个面向 Windows 11 的零内核驱动隐私防窥、防截
 
 ---
 
+## 三分钟小白科普：我们是怎么“白嫖”微软和 AMD 版权保护的？
+
+如果你之前用过 **Netflix、Apple TV+ 或播放 4K 蓝光电影**，可能注意过一个现象：电脑屏幕上明明放着高清电影，但只要一按微信截屏、OBS 录屏或者远控，**画面立刻变成一块纯黑**。
+
+这背后是微软（Windows DWM / DXGI 显示合成器）和显卡厂商（比如 AMD 的 **TMZ** Trusted Memory Zone 硬件信任内存区）联手修好的**“影视级硬件防盗版专用通道”（DRM / 受保护媒体路径）**：
+- 视频帧在显存里勾选 `HW_PROTECTED | DISPLAY_ONLY`（标志位 `0x420`）后，**像素在显卡显存里就已经处于硬件密文状态**——实测拿另一个独立 D3D11 设备通过 `OpenSharedResource1 -> CopyResource` 硬抠显存，读出来的只有 4096+ 种高熵加密乱码，`0/16384` 明文匹配；
+- 只有顺着显卡直连物理显示器的输出线时才在硬件管线末端解码亮在屏幕上，Windows 的一切系统截屏 API（`BitBlt`、`DXGI`、`WGC`、`PrintWindow`）会在内核/DWM/GPU 层直接被掐断返回纯黑。
+
+以前这套机制专供好莱坞大片和付费流媒体防盗版。**AegisBlackout 的核心思路非常简单粗暴：不写高危未签名 `.sys` 驱动，也不去买昂贵的 PlayReady 商业版权证书——直接借壳“白嫖”微软和 AMD 现成的硬件防盗版保险箱，拿来保护你自己的隐私屏幕与私人文件！**
+
+1. **第一招：把私密文件「直接塞进加密显存保险箱」（`AegisVault`）**
+   想看敏感截图、证件或隐私文档？别放在普通窗口里裸奔。`AegisVault` 把内容直接传进 `0x420` 硬件加密显存交换链里渲染——你的肉眼通过显示器线缆正常浏览，但任何后台程序想读显存、抓句柄、截屏，拿到的都是加密乱码或纯黑；关闭窗口瞬间用 `SecureZeroMemory` 将主机内存里的明文像素与路径彻底抹零。
+2. **第二招：「偷梁换柱」，把整个桌面和全部软件拉进防盗版专车道（`AegisBlackout` + `GhostSwap`）**
+   - **借壳全屏数字版权幕布（`AegisBlackout`）**：好莱坞播放器只遮自己一个小窗口，我们直接把一张开着 `0x420` 硬件加密的 4K DirectComposition 透明幕布（透明度仅 `1/255`，鼠标键盘完全穿透）铺满整个桌面。你的眼睛完全感觉不到它，但它只要亮着，整个桌面在系统截屏和录屏眼里就等同于“正在播放加密 4K 蓝光”，直接触发全黑拦截；配合零注入 `Special-APC` 直接让目标进程自己调用微软签名 `win32u` 接口给自己挂上 `WDA_EXCLUDEFROMCAPTURE (0x11)`，连定向单窗抓拍也直接黑透且 **0% 雪花**。
+   - **DXGI 交换链「偷梁换柱」（`GhostSwap` 可选极端模式）**：把本来只会出现在普通窗口里的 DirectX 渲染流程，在目标 GPU 进程创建与缩放交换链的瞬间用纯内存 `.gpic` 位置无关代码截胡，悄悄替换塞进 `0x20 DISPLAY_ONLY`“仅限物理显示器可见、禁止一切桌面回读”的版权专车道（不改动硬盘上的 `.exe` / `.dll`）。
+3. **一句话看懂你的日常体验**：
+   你平时看 4K 144Hz 桌面 **100% 原生清晰、零雪花、后台无黑框**；微信、QQ、OBS、系统 `Win+Shift+S`、远控木马截出来 **0.00% 全黑**；你自己按物理键盘 **`Ctrl + Alt + Q`**，护盾核验真人硬件按键后毫秒放行拍一张清晰全屏；身边真有人举手机偷拍，按 **`Ctrl + Alt + F9`** 瞬间降下 **0 频闪、0 占用的纯黑砖幕布**！
+
+---
+
 ## English Overview
 
 **AegisBlackout v4.1.0** is a driverless Windows 11 anti-screen-capture, anti-recording, and privacy curtain framework designed for VBS/HVCI, ACG/CIG/CFG, and competitive gaming/anti-cheat environments:
