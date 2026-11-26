@@ -29,9 +29,9 @@ if not exist "%BIN_DIR%\GhostSwap.exe" (
 cls
 cd /d "%BIN_DIR%"
 echo ====================================================================
-echo   GhostSwap v2.1 无感后台控制面板
+echo   GhostSwap v2.2 无感后台控制面板
 echo ====================================================================
-echo   [1] 查看实时状态 (GhostSwap v2.1 + AegisBlackout 状态)
+echo   [1] 查看实时状态 (GhostSwap v2.2 + AegisBlackout v4.2 状态与哨兵告警)
 echo   [2] 安全关闭 GhostSwap 后台
 echo   [3] 切换为「协同护盾模式」(推荐：防截屏 0%% 泄漏 / Ctrl+Alt+Q 清晰截屏)
 echo   [4] 切换为「极端显存焊死模式 (--lock-vram)」(连 Ctrl+Alt+Q 也截黑)
@@ -55,6 +55,14 @@ if exist "%BIN_DIR%\aegis_init.log" (
     echo --- AegisBlackout 初始化日志 ---
     type "%BIN_DIR%\aegis_init.log"
     echo --------------------------------
+)
+echo.
+if exist "%BIN_DIR%\aegis_security_alerts.log" (
+    echo --- 实时主动防御告警 (aegis_security_alerts.log) ---
+    powershell -NoProfile -Command "Get-Content -LiteralPath '%BIN_DIR%\aegis_security_alerts.log' -Tail 20"
+    echo ----------------------------------------------------
+) else (
+    echo [哨兵状态] 实时哨兵运行正常，暂无安全告警 (0 alerts)。
 )
 echo.
 pause

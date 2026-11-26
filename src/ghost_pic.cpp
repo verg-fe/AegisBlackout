@@ -448,12 +448,59 @@ HRESULT STDMETHODCALLTYPE GhostHook_ResizeBuffers1(
     return hr;
 }
 
+static __forceinline bool PicAddrInAllowedRange(const GhostStubData* d, uint64_t a)
+{
+    return (a >= d->dxgiBase && a < d->dxgiEnd) ||
+           (a >= d->gpicBase && a < d->gpicEnd);
+}
+
+static __forceinline void PicCheckSwapChainVTable(GhostStubData* d, void* This, bool checkPresent1)
+{
+    if (!d || !This || d->dxgiBase == 0 || d->gpicBase == 0) return;
+    void** vt = *(void***)This;
+    if (!vt) return;
+
+    uint64_t a8 = (uint64_t)(ULONG_PTR)vt[8];
+    if (!PicAddrInAllowedRange(d, a8)) {
+        d->lastTamperSlot = 8u;
+        d->lastTamperAddr = a8;
+        _InterlockedIncrement(&d->vtableTamperCount);
+        return;
+    }
+    uint64_t a9 = (uint64_t)(ULONG_PTR)vt[9];
+    if (!PicAddrInAllowedRange(d, a9)) {
+        d->lastTamperSlot = 9u;
+        d->lastTamperAddr = a9;
+        _InterlockedIncrement(&d->vtableTamperCount);
+        return;
+    }
+    uint64_t a13 = (uint64_t)(ULONG_PTR)vt[13];
+    if (!PicAddrInAllowedRange(d, a13)) {
+        d->lastTamperSlot = 13u;
+        d->lastTamperAddr = a13;
+        _InterlockedIncrement(&d->vtableTamperCount);
+        return;
+    }
+    if (checkPresent1) {
+        uint64_t a22 = (uint64_t)(ULONG_PTR)vt[22];
+        if (!PicAddrInAllowedRange(d, a22)) {
+            d->lastTamperSlot = 22u;
+            d->lastTamperAddr = a22;
+            _InterlockedIncrement(&d->vtableTamperCount);
+            return;
+        }
+    }
+}
+
 __declspec(noinline)
 HRESULT STDMETHODCALLTYPE GhostHook_Present(
     void* This, UINT SyncInterval, UINT Flags)
 {
     GhostStubData* d = PicGetData();
     _InterlockedIncrement(&d->presentCalls);
+    if (d->enabled) {
+        PicCheckSwapChainVTable(d, This, false);
+    }
     if (d->enabled && d->forceResetOnceForExisting && !(Flags & DXGI_PRESENT_TEST)) {
         IDXGISwapChain1* sc1 = nullptr;
         if (SUCCEEDED(((IDXGISwapChain*)This)->QueryInterface(d->iidDXGISwapChain1, (void**)&sc1)) && sc1) {
@@ -480,6 +527,9 @@ HRESULT STDMETHODCALLTYPE GhostHook_Present1(
 {
     GhostStubData* d = PicGetData();
     _InterlockedIncrement(&d->presentCalls);
+    if (d->enabled) {
+        PicCheckSwapChainVTable(d, This, true);
+    }
     if (d->enabled && d->forceResetOnceForExisting && !(PresentFlags & DXGI_PRESENT_TEST)) {
         IDXGISwapChain1* sc1 = nullptr;
         if (SUCCEEDED(((IDXGISwapChain*)This)->QueryInterface(d->iidDXGISwapChain1, (void**)&sc1)) && sc1) {

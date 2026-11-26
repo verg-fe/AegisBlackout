@@ -12,9 +12,16 @@
 #include <sddl.h>
 #include <bcrypt.h>
 #include <tlhelp32.h>
+#include <psapi.h>
+#include <wintrust.h>
+#include <softpub.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <share.h>
 #include <algorithm>
+#include <string>
+#include <vector>
+#include <unordered_map>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -25,6 +32,9 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
 
 #ifndef WDA_NONE
 #define WDA_NONE 0x00000000
@@ -61,9 +71,11 @@
 #endif
 
 #define WM_APP_RESTORE_CURTAIN (WM_APP + 1)
+#define WM_APP_SECURITY_ALERT  (WM_APP + 2)
 #define TIMER_WATCHDOG_ID      1
 #define TIMER_HWDRM_HEARTBEAT  2
 #define TIMER_CLOAK_SWEEP_ID   3
+#define TIMER_ALERT_HIDE_ID    4
 #ifndef QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC
 #define QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC 0x00000001
 #endif
@@ -80,19 +92,25 @@ typedef NTSTATUS_AEGIS(NTAPI* PFN_NtQueueApcThreadEx2)(
 );
 typedef BOOL(WINAPI* PFN_IsWow64Process2)(HANDLE, USHORT*, USHORT*);
 
-/* Startup-only diagnostic logger (never writes during runtime screenshot events) */
-static void StartupLog(const char* line, BOOL overwrite)
+static BOOL GetExeRelativePathW(const WCHAR* fileName, WCHAR* outPath, size_t maxChars)
 {
-    wchar_t logPath[MAX_PATH] = { 0 };
-    DWORD len = GetModuleFileNameW(NULL, logPath, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) return;
-    wchar_t* slash = wcsrchr(logPath, L'\\');
+    if (!fileName || !outPath || maxChars == 0) return FALSE;
+    DWORD len = GetModuleFileNameW(NULL, outPath, (DWORD)maxChars);
+    if (len == 0 || len >= maxChars) return FALSE;
+    WCHAR* slash = wcsrchr(outPath, L'\\');
     if (slash) {
         *(slash + 1) = L'\0';
     } else {
-        logPath[0] = L'\0';
+        outPath[0] = L'\0';
     }
-    if (wcscat_s(logPath, MAX_PATH, L"aegis_init.log") != 0) return;
+    return wcscat_s(outPath, maxChars, fileName) == 0;
+}
+
+/* Startup-only diagnostic logger (never writes during runtime screenshot events) */
+static void StartupLog(const char* line, BOOL overwrite)
+{
+    WCHAR logPath[MAX_PATH] = { 0 };
+    if (!GetExeRelativePathW(L"aegis_init.log", logPath, MAX_PATH)) return;
 
     FILE* f = NULL;
     if (_wfopen_s(&f, logPath, overwrite ? L"w" : L"a") == 0 && f) {
@@ -114,6 +132,7 @@ static HINSTANCE g_hInst = NULL;
 static HWND      g_hCurtain = NULL;
 static HWND      g_hCanvasWnd = NULL;
 static HWND      g_hInputWnd = NULL;
+static HWND      g_hAlertWnd = NULL;
 static HWINEVENTHOOK g_hWinEventFg     = NULL;
 static HWINEVENTHOOK g_hWinEventShow   = NULL;
 static HWINEVENTHOOK g_hWinEventLoc    = NULL;
@@ -121,6 +140,465 @@ static HWINEVENTHOOK g_hWinEventCreate = NULL;
 
 static int g_vx = 0, g_vy = 0, g_vw = 3840, g_vh = 2160;
 static volatile BOOL g_bInternalUnmasking = FALSE;
+static void RefreshVirtualScreenBounds(void);
+
+/* -------------------------------------------------------------------------- */
+/* v4.2 Real-Time Security Alert Engine (Log + Dedup + IPC + Red HUD Banner)  */
+/* -------------------------------------------------------------------------- */
+#define MAX_ALERT_DEDUP 64
+
+struct AlertDedupEntry {
+    char      key[192];
+    ULONGLONG lastTick;
+};
+
+static CRITICAL_SECTION g_alertCs;
+static BOOL             g_alertCsInit = FALSE;
+static AlertDedupEntry  g_alertDedup[MAX_ALERT_DEDUP] = {};
+static int              g_alertDedupNext = 0;
+static WCHAR            g_alertBannerText[280] = L"";
+static HANDLE           g_hAlertEvent = NULL;
+static HANDLE           g_hSentinelStopEv = NULL;
+static HANDLE           g_hSentinelThread = NULL;
+static volatile BOOL    g_bSentinelActive = FALSE;
+
+static void UpperCaseWStr(WCHAR* s)
+{
+    if (!s) return;
+    for (; *s; ++s) {
+        if (*s >= L'a' && *s <= L'z') *s = (WCHAR)(*s - L'a' + L'A');
+    }
+}
+
+static void EnsureAlertEventCreated(void)
+{
+    if (g_hAlertEvent) return;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, FALSE };
+    PSECURITY_DESCRIPTOR pSd = NULL;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)", SDDL_REVISION_1, &pSd, NULL)) {
+        sa.lpSecurityDescriptor = pSd;
+    }
+    g_hAlertEvent = CreateEventW(&sa, FALSE, FALSE, L"Local\\AegisBlackout_SecurityAlert_Ev");
+    if (pSd) LocalFree(pSd);
+}
+
+static void EmitSecurityAlert(
+    const char* alertType,
+    DWORD pid,
+    const WCHAR* exeName,
+    const char* detailUtf8,
+    const char* dedupKey)
+{
+    if (!g_alertCsInit) return;
+    ULONGLONG now = GetTickCount64();
+
+    EnterCriticalSection(&g_alertCs);
+    if (dedupKey && dedupKey[0]) {
+        for (int i = 0; i < MAX_ALERT_DEDUP; i++) {
+            if (g_alertDedup[i].key[0] &&
+                _stricmp(g_alertDedup[i].key, dedupKey) == 0 &&
+                (now - g_alertDedup[i].lastTick) < 30000ULL) {
+                LeaveCriticalSection(&g_alertCs);
+                return;
+            }
+        }
+        strncpy_s(g_alertDedup[g_alertDedupNext].key, dedupKey, _TRUNCATE);
+        g_alertDedup[g_alertDedupNext].lastTick = now;
+        g_alertDedupNext = (g_alertDedupNext + 1) % MAX_ALERT_DEDUP;
+    }
+
+    char exeUtf8[128] = "unknown";
+    if (exeName && exeName[0]) {
+        WideCharToMultiByte(CP_UTF8, 0, exeName, -1, exeUtf8, sizeof(exeUtf8) - 1, NULL, NULL);
+    }
+
+    WCHAR alertLogPath[MAX_PATH] = L"";
+    if (GetExeRelativePathW(L"aegis_security_alerts.log", alertLogPath, MAX_PATH)) {
+        SYSTEMTIME lt = {};
+        GetLocalTime(&lt);
+        FILE* f = _wfsopen(alertLogPath, L"ab", _SH_DENYNO);
+        if (f) {
+            fprintf(f, "[%04u-%02u-%02u %02u:%02u:%02u] [%s] PID=%lu EXE=%s %s\n",
+                lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond,
+                alertType ? alertType : "ALERT",
+                pid, exeUtf8, detailUtf8 ? detailUtf8 : "");
+            fflush(f);
+            fclose(f);
+        }
+    }
+
+    WCHAR wType[48] = L"ALERT";
+    WCHAR wDetail[160] = L"";
+    if (alertType) MultiByteToWideChar(CP_UTF8, 0, alertType, -1, wType, 47);
+    if (detailUtf8) MultiByteToWideChar(CP_UTF8, 0, detailUtf8, -1, wDetail, 159);
+    _snwprintf_s(g_alertBannerText, _TRUNCATE,
+        L"[AegisBlackout \u5B89\u5168\u544A\u8B66] [%ls] %ls (PID %lu): %ls",
+        wType, (exeName && exeName[0]) ? exeName : L"unknown", pid, wDetail);
+    LeaveCriticalSection(&g_alertCs);
+
+    if (g_hCurtain) {
+        PostMessageW(g_hCurtain, WM_APP_SECURITY_ALERT, 0, 0);
+    }
+}
+
+static LRESULT CALLBACK AlertWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps = {};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+
+        HBRUSH bgBrush = CreateSolidBrush(RGB(48, 10, 14));
+        FillRect(hdc, &rc, bgBrush);
+        DeleteObject(bgBrush);
+
+        HPEN pen = CreatePen(PS_SOLID, 2, RGB(239, 68, 68));
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+
+        WCHAR msgBuf[280] = L"";
+        if (g_alertCsInit) {
+            EnterCriticalSection(&g_alertCs);
+            wcsncpy_s(msgBuf, g_alertBannerText, _TRUNCATE);
+            LeaveCriticalSection(&g_alertCs);
+        }
+
+        int dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+        if (dpi <= 0) dpi = 96;
+        HFONT font = CreateFontW(-MulDiv(12, dpi, 72), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei UI");
+        HGDIOBJ oldFont = font ? SelectObject(hdc, font) : NULL;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(254, 226, 226));
+        RECT rcText = { rc.left + 14, rc.top + 4, rc.right - 14, rc.bottom - 4 };
+        DrawTextW(hdc, msgBuf, -1, &rcText, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        if (oldFont) SelectObject(hdc, oldFont);
+        if (font) DeleteObject(font);
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_DESTROY:
+        if (g_hAlertWnd == hwnd) g_hAlertWnd = NULL;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowOrRefreshAlertHud(void)
+{
+    if (!g_hCurtain || !g_hInst) return;
+    RefreshVirtualScreenBounds();
+    if (!g_hAlertWnd) {
+        WCHAR alertCls[64];
+        wsprintfW(alertCls, L"AegisAlertHud_%08X", RandU32());
+        WNDCLASSW wc = { 0 };
+        wc.lpfnWndProc   = AlertWndProc;
+        wc.hInstance     = g_hInst;
+        wc.lpszClassName = alertCls;
+        RegisterClassW(&wc);
+
+        g_hAlertWnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+            wc.lpszClassName,
+            L"",
+            WS_POPUP,
+            g_vx, g_vy + 20, 900, 54,
+            NULL, NULL, g_hInst, NULL
+        );
+        if (!g_hAlertWnd) return;
+        SetLayeredWindowAttributes(g_hAlertWnd, 0, 238, LWA_ALPHA);
+        SetWindowDisplayAffinity(g_hAlertWnd, WDA_MONITOR);
+    }
+
+    int hudW = std::min(1080, std::max(420, g_vw - 40));
+    int hudX = g_vx + (g_vw - hudW) / 2;
+    int hudY = g_vy + 20;
+    SetWindowDisplayAffinity(g_hAlertWnd, WDA_MONITOR);
+    SetWindowPos(g_hAlertWnd, HWND_TOPMOST, hudX, hudY, hudW, 54, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_hAlertWnd, NULL, TRUE);
+    KillTimer(g_hCurtain, TIMER_ALERT_HIDE_ID);
+    SetTimer(g_hCurtain, TIMER_ALERT_HIDE_ID, 8000, NULL);
+}
+
+static void CheckExternalAlertIpcFile(void)
+{
+    WCHAR lastAlertPath[MAX_PATH] = L"";
+    if (!GetExeRelativePathW(L"aegis_last_alert.txt", lastAlertPath, MAX_PATH)) return;
+    FILE* f = _wfsopen(lastAlertPath, L"rb", _SH_DENYNO);
+    if (!f) return;
+    char line[512] = "";
+    if (fgets(line, sizeof(line), f) == NULL) {
+        fclose(f);
+        return;
+    }
+    fclose(f);
+
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) {
+        line[--len] = '\0';
+    }
+    if (len == 0) return;
+
+    /* Expected format from GhostSwap: TYPE|PID|EXE|DETAIL|DEDUP */
+    char* p1 = strchr(line, '|');
+    char* p2 = p1 ? strchr(p1 + 1, '|') : NULL;
+    char* p3 = p2 ? strchr(p2 + 1, '|') : NULL;
+    char* p4 = p3 ? strchr(p3 + 1, '|') : NULL;
+    if (p1 && p2 && p3) {
+        *p1 = '\0'; *p2 = '\0'; *p3 = '\0';
+        if (p4) *p4 = '\0';
+        DWORD pid = (DWORD)strtoul(p1 + 1, NULL, 10);
+        WCHAR wExe[128] = L"unknown";
+        MultiByteToWideChar(CP_UTF8, 0, p2 + 1, -1, wExe, 127);
+        const char* detail = p3 + 1;
+        const char* dedup = (p4 && p4[1]) ? (p4 + 1) : detail;
+        EmitSecurityAlert(line, pid, wExe, detail, dedup);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* v4.2 Surgical Target Process Anti-Inject DACL Lock & Clean Restoration     */
+/* -------------------------------------------------------------------------- */
+#define MAX_HARDENED_PIDS 128
+struct HardenedProcEntry {
+    DWORD                pid;
+    PSECURITY_DESCRIPTOR origSd;
+};
+static CRITICAL_SECTION  g_daclCs;
+static BOOL              g_daclCsInit = FALSE;
+static HardenedProcEntry g_hardenedProcs[MAX_HARDENED_PIDS] = {};
+static int               g_hardenedCount = 0;
+static DWORD             g_daclSkipPids[MAX_HARDENED_PIDS] = {};
+static int               g_daclSkipCount = 0;
+static volatile LONG     g_daclHardenedTotal = 0;
+
+static BOOL IsDaclLockExcludedExe(const WCHAR* upperPath)
+{
+    if (!upperPath || !upperPath[0]) return TRUE;
+    static const wchar_t* exclPatterns[] = {
+        L"CSRSS.EXE", L"DWM.EXE", L"WINLOGON.EXE", L"LSASS.EXE", L"SMSS.EXE",
+        L"SERVICES.EXE", L"SVCHOST.EXE", L"SIHOST.EXE", L"CTFMON.EXE",
+        L"STARTMENUEXPERIENCEHOST.EXE", L"SEARCHHOST.EXE", L"TEXTINPUTHOST.EXE",
+        L"SHELLEXPERIENCEHOST.EXE", L"LOCKAPP.EXE", L"SCREENCLIPPINGHOST.EXE",
+        L"SNIPPINGTOOL.EXE", L"MSMPENG.EXE", L"SECURITYHEALTHSYSTRAY.EXE",
+        L"SBIE", L"SANDMAN.EXE", L"EASYANTICHEAT", L"BATTLEYE",
+        L"VGC.EXE", L"GAMEGUARD", L"\\STEAMLIBRARY\\", L"STEAM.EXE", L"EPICGAMESLAUNCHER.EXE",
+        L"WEGAME", L"TENPROTECT", L"ACE-",
+        L"GHOSTSWAP", L"AEGISBLACKOUT",
+        L"EXPLORER.EXE", L"CONHOST.EXE", L"OPENCONSOLE.EXE", L"WINDOWSTERMINAL.EXE",
+        L"CMD.EXE", L"POWERSHELL.EXE", L"PWSH.EXE",
+        L"CODE.EXE", L"DEVENV.EXE", L"MSBUILD.EXE",
+        L"CL.EXE", L"LINK.EXE", L"SANDBOXIE_"
+    };
+    for (size_t i = 0; i < sizeof(exclPatterns) / sizeof(exclPatterns[0]); i++) {
+        if (wcsstr(upperPath, exclPatterns[i]) != NULL) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL IsPidDaclAttempted(DWORD pid)
+{
+    for (int i = 0; i < g_hardenedCount; i++) {
+        if (g_hardenedProcs[i].pid == pid) return TRUE;
+    }
+    for (int i = 0; i < g_daclSkipCount; i++) {
+        if (g_daclSkipPids[i] == pid) return TRUE;
+    }
+    return FALSE;
+}
+
+static void RecordDaclSkipPid(DWORD pid)
+{
+    if (g_daclSkipCount < MAX_HARDENED_PIDS) {
+        g_daclSkipPids[g_daclSkipCount++] = pid;
+    }
+}
+
+static void HardenTargetProcessDacl(DWORD pid, const WCHAR* upperPath)
+{
+    if (!g_daclCsInit || pid <= 4 || pid == GetCurrentProcessId()) return;
+    if (IsDaclLockExcludedExe(upperPath)) return;
+
+    EnterCriticalSection(&g_daclCs);
+    BOOL seen = IsPidDaclAttempted(pid);
+    LeaveCriticalSection(&g_daclCs);
+    if (seen) return;
+
+    HANDLE hProc = OpenProcess(READ_CONTROL | WRITE_DAC | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) {
+        EnterCriticalSection(&g_daclCs);
+        RecordDaclSkipPid(pid);
+        LeaveCriticalSection(&g_daclCs);
+        return;
+    }
+
+    PACL pOldDacl = NULL;
+    PSECURITY_DESCRIPTOR pOldSd = NULL;
+    DWORD res = GetSecurityInfo(hProc, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+        NULL, NULL, &pOldDacl, NULL, &pOldSd);
+    if (res != ERROR_SUCCESS || !pOldDacl || !pOldSd) {
+        if (pOldSd) LocalFree(pOldSd);
+        CloseHandle(hProc);
+        EnterCriticalSection(&g_daclCs);
+        RecordDaclSkipPid(pid);
+        LeaveCriticalSection(&g_daclCs);
+        return;
+    }
+
+    BYTE sysSidBuf[SECURITY_MAX_SID_SIZE] = {};
+    BYTE adminSidBuf[SECURITY_MAX_SID_SIZE] = {};
+    DWORD sysSidLen = sizeof(sysSidBuf), adminSidLen = sizeof(adminSidBuf);
+    PSID pSysSid = CreateWellKnownSid(WinLocalSystemSid, NULL, sysSidBuf, &sysSidLen) ? (PSID)sysSidBuf : NULL;
+    PSID pAdminSid = CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, adminSidBuf, &adminSidLen) ? (PSID)adminSidBuf : NULL;
+
+    ACL_SIZE_INFORMATION asi = {};
+    if (!GetAclInformation(pOldDacl, &asi, sizeof(asi), AclSizeInformation)) {
+        LocalFree(pOldSd);
+        CloseHandle(hProc);
+        return;
+    }
+
+    DWORD newAclSize = asi.AclBytesInUse + 160;
+    PACL pNewDacl = (PACL)LocalAlloc(LPTR, newAclSize);
+    if (!pNewDacl || !InitializeAcl(pNewDacl, newAclSize, ACL_REVISION)) {
+        if (pNewDacl) LocalFree(pNewDacl);
+        LocalFree(pOldSd);
+        CloseHandle(hProc);
+        return;
+    }
+
+    const DWORD kStripMask =
+        PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_VM_READ |
+        PROCESS_CREATE_THREAD | PROCESS_DUP_HANDLE | PROCESS_SET_INFORMATION |
+        WRITE_DAC | WRITE_OWNER;
+
+    BOOL hasSys = FALSE, hasAdmin = FALSE, buildOk = TRUE;
+    for (DWORD i = 0; i < asi.AceCount && buildOk; i++) {
+        LPVOID pAce = NULL;
+        if (!GetAce(pOldDacl, i, &pAce) || !pAce) continue;
+        ACE_HEADER* hdr = (ACE_HEADER*)pAce;
+        if (hdr->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+            ACCESS_ALLOWED_ACE* allowAce = (ACCESS_ALLOWED_ACE*)pAce;
+            PSID aceSid = (PSID)&allowAce->SidStart;
+            DWORD mask = allowAce->Mask;
+            if (pSysSid && EqualSid(aceSid, pSysSid)) {
+                mask |= PROCESS_ALL_ACCESS;
+                hasSys = TRUE;
+            } else if (pAdminSid && EqualSid(aceSid, pAdminSid)) {
+                mask |= PROCESS_ALL_ACCESS;
+                hasAdmin = TRUE;
+            } else {
+                if (mask & GENERIC_ALL) {
+                    mask |= (PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE);
+                }
+                mask &= ~(kStripMask | GENERIC_ALL | GENERIC_WRITE);
+                if (mask == 0) continue;
+            }
+            if (!AddAccessAllowedAceEx(pNewDacl, ACL_REVISION, hdr->AceFlags, mask, aceSid)) {
+                buildOk = FALSE;
+            }
+        } else {
+            if (!AddAce(pNewDacl, ACL_REVISION, MAXDWORD, pAce, hdr->AceSize)) {
+                buildOk = FALSE;
+            }
+        }
+    }
+
+    if (buildOk && pSysSid && !hasSys) {
+        if (!AddAccessAllowedAce(pNewDacl, ACL_REVISION, PROCESS_ALL_ACCESS, pSysSid)) buildOk = FALSE;
+    }
+    if (buildOk && pAdminSid && !hasAdmin) {
+        if (!AddAccessAllowedAce(pNewDacl, ACL_REVISION, PROCESS_ALL_ACCESS, pAdminSid)) buildOk = FALSE;
+    }
+
+    DWORD setRes = ERROR_GEN_FAILURE;
+    if (buildOk) {
+        setRes = SetSecurityInfo(hProc, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+            NULL, NULL, pNewDacl, NULL);
+    }
+
+    LocalFree(pNewDacl);
+    CloseHandle(hProc);
+
+    EnterCriticalSection(&g_daclCs);
+    if (setRes == ERROR_SUCCESS && g_hardenedCount < MAX_HARDENED_PIDS) {
+        g_hardenedProcs[g_hardenedCount].pid = pid;
+        g_hardenedProcs[g_hardenedCount].origSd = pOldSd;
+        g_hardenedCount++;
+        _InterlockedIncrement(&g_daclHardenedTotal);
+        pOldSd = NULL;
+    } else {
+        RecordDaclSkipPid(pid);
+    }
+    LeaveCriticalSection(&g_daclCs);
+
+    if (pOldSd) LocalFree(pOldSd);
+}
+
+static void PruneDeadHardenedDacls(const std::vector<DWORD>& alivePids)
+{
+    if (!g_daclCsInit) return;
+    EnterCriticalSection(&g_daclCs);
+    int w = 0;
+    for (int i = 0; i < g_hardenedCount; i++) {
+        bool alive = std::find(alivePids.begin(), alivePids.end(), g_hardenedProcs[i].pid) != alivePids.end();
+        if (alive) {
+            g_hardenedProcs[w++] = g_hardenedProcs[i];
+        } else {
+            if (g_hardenedProcs[i].origSd) LocalFree(g_hardenedProcs[i].origSd);
+        }
+    }
+    g_hardenedCount = w;
+
+    int sw = 0;
+    for (int i = 0; i < g_daclSkipCount; i++) {
+        if (std::find(alivePids.begin(), alivePids.end(), g_daclSkipPids[i]) != alivePids.end()) {
+            g_daclSkipPids[sw++] = g_daclSkipPids[i];
+        }
+    }
+    g_daclSkipCount = sw;
+    LeaveCriticalSection(&g_daclCs);
+}
+
+static void RestoreAllTargetDacls(void)
+{
+    if (!g_daclCsInit) return;
+    EnterCriticalSection(&g_daclCs);
+    for (int i = 0; i < g_hardenedCount; i++) {
+        DWORD pid = g_hardenedProcs[i].pid;
+        PSECURITY_DESCRIPTOR pSd = g_hardenedProcs[i].origSd;
+        if (pSd) {
+            HANDLE hProc = OpenProcess(WRITE_DAC, FALSE, pid);
+            if (hProc) {
+                BOOL present = FALSE, defaulted = FALSE;
+                PACL pOrigDacl = NULL;
+                if (GetSecurityDescriptorDacl(pSd, &present, &pOrigDacl, &defaulted) && present) {
+                    SetSecurityInfo(hProc, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                        NULL, NULL, pOrigDacl, NULL);
+                }
+                CloseHandle(hProc);
+            }
+            LocalFree(pSd);
+            g_hardenedProcs[i].origSd = NULL;
+        }
+    }
+    g_hardenedCount = 0;
+    g_daclSkipCount = 0;
+    LeaveCriticalSection(&g_daclCs);
+}
 
 /* 24x7 GPU Hardware-Protected DRM Overlay state */
 static ID3D11Device*           g_pD3DDev      = nullptr;
@@ -170,15 +648,19 @@ struct DevCacheEntry {
 static DevCacheEntry g_devCache[MAX_DEV_CACHE];
 static int g_devCacheCount = 0;
 
-/* v4 Zero-Injection Per-Window Special-APC Cloak state */
+/* v4.2 Zero-Injection Per-Window Special-APC Cloak + WDA Tamper Sentinel state */
 #define MAX_CLOAKED_HWNDS 256
 #define MAX_FAILED_HWNDS  256
 #define MAX_PENDING_CLOAK 32
 struct CloakedEntry {
-    HWND  hwnd;
-    DWORD pid;
-    DWORD tid;
-    DWORD appliedAff;
+    HWND      hwnd;
+    DWORD     pid;
+    DWORD     tid;
+    DWORD     appliedAff;
+    int       dropCount;
+    ULONGLONG lastDropTick;
+    ULONGLONG dropAlertArmedTick;
+    ULONGLONG reapplyGraceUntil;
 };
 struct PendingCloakEntry {
     HWND      hwnd;
@@ -186,10 +668,14 @@ struct PendingCloakEntry {
     DWORD     tid;
     ULONGLONG queuedTick;
     BOOL      triedFallback;
+    int       apcSentCount;
 };
 struct FailedEntry {
-    HWND hwnd;
-    int  retries;
+    HWND  hwnd;
+    DWORD pid;
+    int   retries;
+    BOOL  apcDeliveredEver;
+    BOOL  hijackAlerted;
 };
 static CloakedEntry      g_cloaked[MAX_CLOAKED_HWNDS];
 static int               g_cloakedCount = 0;
@@ -203,6 +689,46 @@ static PVOID                   g_pNtUserSetWDA        = NULL;
 static PFN_IsWow64Process2     g_pIsWow64Process2     = NULL;
 static BOOL      g_bPerWndCloakReady = FALSE;
 static BOOL      g_bCloakSweeping    = FALSE;
+
+static CRITICAL_SECTION g_monitoredCs;
+static BOOL             g_monitoredCsInit = FALSE;
+static DWORD            g_monitoredSeeds[MAX_CLOAKED_HWNDS] = {};
+static int              g_monitoredSeedCount = 0;
+
+static void GetExeBaseNameForPid(DWORD pid, WCHAR* outBase, size_t maxChars)
+{
+    if (!outBase || maxChars == 0) return;
+    wcscpy_s(outBase, maxChars, L"unknown");
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) return;
+    WCHAR img[MAX_PATH] = L"";
+    DWORD imgLen = MAX_PATH;
+    if (QueryFullProcessImageNameW(hProc, 0, img, &imgLen)) {
+        const WCHAR* slash = wcsrchr(img, L'\\');
+        const WCHAR* base = slash ? (slash + 1) : img;
+        wcsncpy_s(outBase, maxChars, base, _TRUNCATE);
+    }
+    CloseHandle(hProc);
+}
+
+static void PublishMonitoredSeeds(void)
+{
+    if (!g_monitoredCsInit) return;
+    EnterCriticalSection(&g_monitoredCs);
+    g_monitoredSeedCount = 0;
+    for (int i = 0; i < g_cloakedCount; i++) {
+        DWORD pid = g_cloaked[i].pid;
+        if (pid <= 4) continue;
+        BOOL dup = FALSE;
+        for (int j = 0; j < g_monitoredSeedCount; j++) {
+            if (g_monitoredSeeds[j] == pid) { dup = TRUE; break; }
+        }
+        if (!dup && g_monitoredSeedCount < MAX_CLOAKED_HWNDS) {
+            g_monitoredSeeds[g_monitoredSeedCount++] = pid;
+        }
+    }
+    LeaveCriticalSection(&g_monitoredCs);
+}
 
 static void InitPerWindowCloak(void)
 {
@@ -222,10 +748,16 @@ static BOOL VerifyWin32uMappedAtSameBase(DWORD pid)
     if (snap == INVALID_HANDLE_VALUE) return FALSE;
 
     BOOL matched = FALSE;
+    BOOL hasSbieDll = FALSE;
     MODULEENTRY32W me = { 0 };
     me.dwSize = sizeof(me);
     if (Module32FirstW(snap, &me)) {
         do {
+            if (_wcsicmp(me.szModule, L"SbieDll.dll") == 0) {
+                hasSbieDll = TRUE;
+                matched = FALSE;
+                break;
+            }
             if (_wcsicmp(me.szModule, L"win32u.dll") == 0) {
                 const BYTE* targetAddr = (const BYTE*)g_pNtUserSetWDA;
                 if (me.modBaseAddr == (BYTE*)g_hWin32uLocal &&
@@ -233,12 +765,11 @@ static BOOL VerifyWin32uMappedAtSameBase(DWORD pid)
                     targetAddr < (me.modBaseAddr + me.modBaseSize)) {
                     matched = TRUE;
                 }
-                break;
             }
         } while (Module32NextW(snap, &me));
     }
     CloseHandle(snap);
-    return matched;
+    return (!hasSbieDll && matched);
 }
 
 static BOOL QueueWindowAffinityApc(HWND hwnd, DWORD tid, DWORD targetAff)
@@ -263,12 +794,17 @@ static BOOL QueueWindowAffinityApc(HWND hwnd, DWORD tid, DWORD targetAff)
     return FALSE;
 }
 
-static BOOL IsKnownCloaked(HWND hwnd)
+static CloakedEntry* FindCloakedEntry(HWND hwnd)
 {
     for (int i = 0; i < g_cloakedCount; i++) {
-        if (g_cloaked[i].hwnd == hwnd) return TRUE;
+        if (g_cloaked[i].hwnd == hwnd) return &g_cloaked[i];
     }
-    return FALSE;
+    return NULL;
+}
+
+static BOOL IsKnownCloaked(HWND hwnd)
+{
+    return FindCloakedEntry(hwnd) != NULL;
 }
 
 static BOOL IsFailedHwnd(HWND hwnd)
@@ -279,17 +815,54 @@ static BOOL IsFailedHwnd(HWND hwnd)
     return FALSE;
 }
 
-static void RecordFailedHwnd(HWND hwnd)
+static BOOL IsRemoteWin32uWdaTampered(DWORD pid)
+{
+    if (!g_pNtUserSetWDA || pid <= 4 || pid == GetCurrentProcessId()) return FALSE;
+    HANDLE hProc = OpenProcess(PROCESS_VM_READ, FALSE, pid);
+    if (!hProc) return FALSE;
+    BYTE remoteBytes[16] = {};
+    SIZE_T nRead = 0;
+    BOOL ok = ReadProcessMemory(hProc, g_pNtUserSetWDA, remoteBytes, 16, &nRead);
+    CloseHandle(hProc);
+    if (!ok || nRead != 16) return FALSE;
+    return memcmp(remoteBytes, g_pNtUserSetWDA, 16) != 0;
+}
+
+static void RecordFailedHwnd(HWND hwnd, DWORD pid = 0, BOOL apcDelivered = FALSE)
 {
     for (int i = 0; i < g_failedCount; i++) {
         if (g_failedEntries[i].hwnd == hwnd) {
             g_failedEntries[i].retries++;
+            if (pid != 0) g_failedEntries[i].pid = pid;
+            if (apcDelivered) g_failedEntries[i].apcDeliveredEver = TRUE;
+            DWORD aff = 0;
+            DWORD targetPid = g_failedEntries[i].pid;
+            if (targetPid == 0) GetWindowThreadProcessId(hwnd, &targetPid);
+            if (g_failedEntries[i].retries >= 3 &&
+                g_failedEntries[i].apcDeliveredEver &&
+                !g_failedEntries[i].hijackAlerted &&
+                IsWindow(hwnd) && IsWindowVisible(hwnd) &&
+                GetWindowDisplayAffinity(hwnd, &aff) && aff == 0 &&
+                IsRemoteWin32uWdaTampered(targetPid)) {
+                g_failedEntries[i].hijackAlerted = TRUE;
+                WCHAR exeBase[128] = L"unknown";
+                GetExeBaseNameForPid(targetPid, exeBase, 128);
+                char detail[160], dedup[192];
+                sprintf_s(detail, sizeof(detail), "HWND=0x%llX WDA remained 0 after %d APCs",
+                    (unsigned long long)(ULONG_PTR)hwnd, g_failedEntries[i].retries);
+                sprintf_s(dedup, sizeof(dedup), "WDA_STUB_%lu_%llX",
+                    targetPid, (unsigned long long)(ULONG_PTR)hwnd);
+                EmitSecurityAlert("WDA_STUB_HIJACK", targetPid, exeBase, detail, dedup);
+            }
             return;
         }
     }
     if (g_failedCount < MAX_FAILED_HWNDS) {
         g_failedEntries[g_failedCount].hwnd = hwnd;
+        g_failedEntries[g_failedCount].pid = pid;
         g_failedEntries[g_failedCount].retries = 1;
+        g_failedEntries[g_failedCount].apcDeliveredEver = apcDelivered;
+        g_failedEntries[g_failedCount].hijackAlerted = FALSE;
         g_failedCount++;
     }
 }
@@ -308,6 +881,7 @@ static void RecordCloakedHwnd(HWND hwnd, DWORD pid, DWORD tid, DWORD aff)
             g_cloaked[i].pid = pid;
             g_cloaked[i].tid = tid;
             g_cloaked[i].appliedAff = aff;
+            g_cloaked[i].dropAlertArmedTick = 0;
             return;
         }
     }
@@ -316,14 +890,84 @@ static void RecordCloakedHwnd(HWND hwnd, DWORD pid, DWORD tid, DWORD aff)
         g_cloaked[g_cloakedCount].pid  = pid;
         g_cloaked[g_cloakedCount].tid  = tid;
         g_cloaked[g_cloakedCount].appliedAff = aff;
+        g_cloaked[g_cloakedCount].dropCount = 0;
+        g_cloaked[g_cloakedCount].lastDropTick = 0;
+        g_cloaked[g_cloakedCount].dropAlertArmedTick = 0;
+        g_cloaked[g_cloakedCount].reapplyGraceUntil = 0;
         g_cloakedCount++;
+    }
+}
+
+static void HandleCloakedWindowAffinityCheck(CloakedEntry* e)
+{
+    if (!e || g_bInternalUnmasking) return;
+    if (!IsWindow(e->hwnd) || !IsWindowVisible(e->hwnd) || IsIconic(e->hwnd)) {
+        e->dropCount = 0;
+        e->dropAlertArmedTick = 0;
+        return;
+    }
+    RECT rc = {};
+    if (!GetWindowRect(e->hwnd, &rc) || (rc.right - rc.left) < 120 || (rc.bottom - rc.top) < 80) {
+        e->dropCount = 0;
+        e->dropAlertArmedTick = 0;
+        return;
+    }
+
+    DWORD aff = 0;
+    if (!GetWindowDisplayAffinity(e->hwnd, &aff)) return;
+    if (aff != 0) {
+        e->dropAlertArmedTick = 0;
+        return;
+    }
+
+    ULONGLONG now = GetTickCount64();
+    DWORD tid = e->tid;
+    if (tid == 0) {
+        DWORD pidTmp = 0;
+        tid = GetWindowThreadProcessId(e->hwnd, &pidTmp);
+    }
+    BOOL apcSent = (tid != 0) ? QueueWindowAffinityApc(e->hwnd, tid, e->appliedAff ? e->appliedAff : WDA_EXCLUDEFROMCAPTURE) : FALSE;
+
+    if (now < e->reapplyGraceUntil) {
+        return;
+    }
+
+    if (e->lastDropTick == 0 || (now - e->lastDropTick) > 2500ULL) {
+        e->dropCount = 1;
+        e->lastDropTick = now;
+        e->dropAlertArmedTick = now;
+    } else if ((now - e->lastDropTick) >= 35ULL) {
+        e->dropCount++;
+        e->lastDropTick = now;
+    }
+
+    BOOL win32uTampered = (e->dropCount >= 2) ? IsRemoteWin32uWdaTampered(e->pid) : FALSE;
+    BOOL sustainedFight = (e->dropCount >= 5 && e->dropAlertArmedTick != 0 && (now - e->dropAlertArmedTick) >= 350ULL);
+    if (sustainedFight || (e->dropCount >= 2 && win32uTampered)) {
+        WCHAR exeBase[128] = L"unknown";
+        GetExeBaseNameForPid(e->pid, exeBase, 128);
+        char detail[160], dedup[192];
+        sprintf_s(detail, sizeof(detail), "HWND=0x%llX dropped WDA->0 (drops=%d)",
+            (unsigned long long)(ULONG_PTR)e->hwnd, e->dropCount);
+        sprintf_s(dedup, sizeof(dedup), "WDA_TAMPER_%lu_%llX",
+            e->pid, (unsigned long long)(ULONG_PTR)e->hwnd);
+        EmitSecurityAlert("WDA_TAMPER", e->pid, exeBase, detail, dedup);
+
+        if (apcSent && (win32uTampered || e->dropCount >= 10)) {
+            char detailStub[160], dedupStub[192];
+            sprintf_s(detailStub, sizeof(detailStub), "HWND=0x%llX failed WDA reapply after %d APCs",
+                (unsigned long long)(ULONG_PTR)e->hwnd, e->dropCount);
+            sprintf_s(dedupStub, sizeof(dedupStub), "WDA_STUB_%lu_%llX",
+                e->pid, (unsigned long long)(ULONG_PTR)e->hwnd);
+            EmitSecurityAlert("WDA_STUB_HIJACK", e->pid, exeBase, detailStub, dedupStub);
+        }
     }
 }
 
 static BOOL IsSafeTargetWindow(HWND hwnd, DWORD* outPid, DWORD* outTid)
 {
     if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return FALSE;
-    if (hwnd == g_hCurtain || hwnd == g_hCanvasWnd || hwnd == g_hInputWnd) return FALSE;
+    if (hwnd == g_hCurtain || hwnd == g_hCanvasWnd || hwnd == g_hInputWnd || hwnd == g_hAlertWnd) return FALSE;
     if (GetAncestor(hwnd, GA_ROOT) != hwnd) return FALSE;
 
     RECT rc = { 0 };
@@ -375,9 +1019,7 @@ static BOOL IsSafeTargetWindow(HWND hwnd, DWORD* outPid, DWORD* outTid)
     CloseHandle(hProc);
     if (!hasImg) return FALSE;
 
-    for (WCHAR* p = img; *p; ++p) {
-        if (*p >= L'a' && *p <= L'z') *p = (WCHAR)(*p - L'a' + L'A');
-    }
+    UpperCaseWStr(img);
 
     static const wchar_t* skipImages[] = {
         L"CSRSS.EXE", L"DWM.EXE", L"WINLOGON.EXE", L"LSASS.EXE", L"SMSS.EXE",
@@ -387,6 +1029,7 @@ static BOOL IsSafeTargetWindow(HWND hwnd, DWORD* outPid, DWORD* outTid)
         L"SNIPPINGTOOL.EXE", L"MSMPENG.EXE", L"SECURITYHEALTHSYSTRAY.EXE",
         L"SBIE", L"SANDMAN.EXE", L"EASYANTICHEAT", L"BATTLEYE",
         L"VGC.EXE", L"GAMEGUARD", L"\\STEAMLIBRARY\\", L"STEAM.EXE", L"EPICGAMESLAUNCHER.EXE",
+        L"WEGAME", L"TENPROTECT", L"ACE-",
         L"GHOSTSWAP"
     };
     for (size_t i = 0; i < sizeof(skipImages) / sizeof(skipImages[0]); i++) {
@@ -422,6 +1065,7 @@ static void UpsertPendingCloak(HWND hwnd, DWORD pid, DWORD tid, ULONGLONG tick, 
         g_pendingCloak[idx].tid = tid;
         g_pendingCloak[idx].queuedTick = tick;
         g_pendingCloak[idx].triedFallback = triedFallback;
+        g_pendingCloak[idx].apcSentCount++;
         return;
     }
     if (g_pendingCount < MAX_PENDING_CLOAK) {
@@ -430,6 +1074,7 @@ static void UpsertPendingCloak(HWND hwnd, DWORD pid, DWORD tid, ULONGLONG tick, 
         g_pendingCloak[g_pendingCount].tid = tid;
         g_pendingCloak[g_pendingCount].queuedTick = tick;
         g_pendingCloak[g_pendingCount].triedFallback = triedFallback;
+        g_pendingCloak[g_pendingCount].apcSentCount = 1;
         g_pendingCount++;
     }
 }
@@ -444,15 +1089,11 @@ static void RemovePendingCloak(int idx)
 static void TryCloakSingleWindow(HWND hwnd)
 {
     if (!g_bPerWndCloakReady || g_bInternalUnmasking || g_bCloakSweeping) return;
-    if (!hwnd || hwnd == g_hCurtain || hwnd == g_hCanvasWnd || hwnd == g_hInputWnd) return;
+    if (!hwnd || hwnd == g_hCurtain || hwnd == g_hCanvasWnd || hwnd == g_hInputWnd || hwnd == g_hAlertWnd) return;
 
-    if (IsKnownCloaked(hwnd)) {
-        DWORD aff = 0;
-        if (GetWindowDisplayAffinity(hwnd, &aff) && aff == 0) {
-            DWORD pid = 0;
-            DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
-            if (tid) QueueWindowAffinityApc(hwnd, tid, WDA_EXCLUDEFROMCAPTURE);
-        }
+    CloakedEntry* existing = FindCloakedEntry(hwnd);
+    if (existing) {
+        HandleCloakedWindowAffinityCheck(existing);
         return;
     }
     if (IsFailedHwnd(hwnd)) return;
@@ -473,10 +1114,12 @@ static void TryCloakSingleWindow(HWND hwnd)
         if (pidx >= 0) {
             RecordCloakedHwnd(hwnd, g_pendingCloak[pidx].pid, g_pendingCloak[pidx].tid, aff);
             RemovePendingCloak(pidx);
+            PublishMonitoredSeeds();
         } else if (aff == WDA_EXCLUDEFROMCAPTURE) {
             DWORD pid = 0, tid = 0;
             if (IsSafeTargetWindow(hwnd, &pid, &tid)) {
                 RecordCloakedHwnd(hwnd, pid, tid, aff);
+                PublishMonitoredSeeds();
             }
         }
         return;
@@ -492,7 +1135,7 @@ static void TryCloakSingleWindow(HWND hwnd)
     if (QueueWindowAffinityApc(hwnd, tid, WDA_EXCLUDEFROMCAPTURE)) {
         UpsertPendingCloak(hwnd, pid, tid, now, FALSE);
     } else {
-        RecordFailedHwnd(hwnd);
+        RecordFailedHwnd(hwnd, pid, FALSE);
         if (pidx >= 0) RemovePendingCloak(pidx);
     }
 }
@@ -531,12 +1174,13 @@ static void SweepAndCloakWindows(void)
                 if (QueueWindowAffinityApc(ph, g_pendingCloak[i].tid, WDA_MONITOR)) {
                     g_pendingCloak[i].triedFallback = TRUE;
                     g_pendingCloak[i].queuedTick = now;
+                    g_pendingCloak[i].apcSentCount++;
                 } else {
-                    RecordFailedHwnd(ph);
+                    RecordFailedHwnd(ph, g_pendingCloak[i].pid, g_pendingCloak[i].apcSentCount > 0);
                     RemovePendingCloak(i);
                 }
             } else {
-                RecordFailedHwnd(ph);
+                RecordFailedHwnd(ph, g_pendingCloak[i].pid, g_pendingCloak[i].apcSentCount > 0);
                 RemovePendingCloak(i);
             }
         }
@@ -550,12 +1194,9 @@ static void SweepAndCloakWindows(void)
 
     EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
         SweepCtx* c = (SweepCtx*)lp;
-        if (IsKnownCloaked(hwnd)) {
-            DWORD aff = 0;
-            if (GetWindowDisplayAffinity(hwnd, &aff) && aff == 0) {
-                DWORD pid = 0; DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
-                if (tid) QueueWindowAffinityApc(hwnd, tid, WDA_EXCLUDEFROMCAPTURE);
-            }
+        CloakedEntry* existing = FindCloakedEntry(hwnd);
+        if (existing) {
+            HandleCloakedWindowAffinityCheck(existing);
             return TRUE;
         }
         if (IsFailedHwnd(hwnd) || FindPendingCloak(hwnd) >= 0) return TRUE;
@@ -580,7 +1221,7 @@ static void SweepAndCloakWindows(void)
                 c->newCount++;
             }
         } else {
-            RecordFailedHwnd(hwnd);
+            RecordFailedHwnd(hwnd, pid, FALSE);
         }
         return TRUE;
     }, (LPARAM)&ctx);
@@ -595,7 +1236,7 @@ static void SweepAndCloakWindows(void)
             } else if (QueueWindowAffinityApc(ctx.newCands[i].hwnd, ctx.newCands[i].tid, WDA_MONITOR)) {
                 anyFallback = TRUE;
             } else {
-                RecordFailedHwnd(ctx.newCands[i].hwnd);
+                RecordFailedHwnd(ctx.newCands[i].hwnd, ctx.newCands[i].pid, TRUE);
             }
         }
         if (anyFallback) {
@@ -606,12 +1247,13 @@ static void SweepAndCloakWindows(void)
                 if (GetWindowDisplayAffinity(ctx.newCands[i].hwnd, &aff) && aff != 0) {
                     RecordCloakedHwnd(ctx.newCands[i].hwnd, ctx.newCands[i].pid, ctx.newCands[i].tid, aff);
                 } else {
-                    RecordFailedHwnd(ctx.newCands[i].hwnd);
+                    RecordFailedHwnd(ctx.newCands[i].hwnd, ctx.newCands[i].pid, TRUE);
                 }
             }
         }
     }
 
+    PublishMonitoredSeeds();
     g_bCloakSweeping = FALSE;
 }
 
@@ -670,13 +1312,18 @@ static void RestoreAllCloakedWindows(BOOL permanent)
     if (permanent) {
         g_cloakedCount = 0;
         g_pendingCount = 0;
+        PublishMonitoredSeeds();
     }
 }
 
 static void ReapplyAllCloakedWindows(void)
 {
     if (!g_bPerWndCloakReady) return;
+    ULONGLONG graceUntil = GetTickCount64() + 500ULL;
     for (int i = 0; i < g_cloakedCount; i++) {
+        g_cloaked[i].dropCount = 0;
+        g_cloaked[i].dropAlertArmedTick = 0;
+        g_cloaked[i].reapplyGraceUntil = graceUntil;
         if (IsWindow(g_cloaked[i].hwnd)) {
             QueueWindowAffinityApc(g_cloaked[i].hwnd, g_cloaked[i].tid, g_cloaked[i].appliedAff);
         }
@@ -833,6 +1480,392 @@ static void PresentHwDrmFrame(void)
     }
 }
 
+/* -------------------------------------------------------------------------- */
+/* v4.2 CoW + Inline-Hook + Unsigned-DLL + GhostSwap IPC Background Sentinel  */
+/* -------------------------------------------------------------------------- */
+struct SentinelWatchTarget {
+    WCHAR modName[32];
+    char  funcName[48];
+    DWORD rva;
+    BYTE  cleanBytes[16];
+};
+
+static std::vector<SentinelWatchTarget> g_watchTargets;
+
+static void AddWatchTarget(HMODULE hMod, const WCHAR* modName, const char* funcName, const void* funcAddr)
+{
+    if (!hMod || !modName || !funcName || !funcAddr) return;
+    MODULEINFO mi = {};
+    if (!GetModuleInformation(GetCurrentProcess(), hMod, &mi, sizeof(mi))) return;
+    const BYTE* base = (const BYTE*)mi.lpBaseOfDll;
+    const BYTE* addr = (const BYTE*)funcAddr;
+    if (addr < base || (addr + 16) > (base + mi.SizeOfImage)) return;
+
+    DWORD rva = (DWORD)(addr - base);
+    for (const auto& t : g_watchTargets) {
+        if (_wcsicmp(t.modName, modName) == 0 && t.rva == rva) return;
+    }
+
+    SentinelWatchTarget item = {};
+    wcsncpy_s(item.modName, modName, _TRUNCATE);
+    strncpy_s(item.funcName, funcName, _TRUNCATE);
+    item.rva = rva;
+    memcpy(item.cleanBytes, addr, 16);
+    g_watchTargets.push_back(item);
+}
+
+static void InitSentinelWatchTargets(void)
+{
+    g_watchTargets.clear();
+
+    if (g_hWin32uLocal && g_pNtUserSetWDA) {
+        AddWatchTarget(g_hWin32uLocal, L"win32u.dll", "NtUserSetWindowDisplayAffinity", g_pNtUserSetWDA);
+    }
+
+    HMODULE hDxgi = GetModuleHandleW(L"dxgi.dll");
+    if (!hDxgi) hDxgi = LoadLibraryW(L"dxgi.dll");
+    if (hDxgi) {
+        AddWatchTarget(hDxgi, L"dxgi.dll", "CreateDXGIFactory",  (const void*)GetProcAddress(hDxgi, "CreateDXGIFactory"));
+        AddWatchTarget(hDxgi, L"dxgi.dll", "CreateDXGIFactory1", (const void*)GetProcAddress(hDxgi, "CreateDXGIFactory1"));
+        AddWatchTarget(hDxgi, L"dxgi.dll", "CreateDXGIFactory2", (const void*)GetProcAddress(hDxgi, "CreateDXGIFactory2"));
+
+        if (g_pSwapChain) {
+            void** scVt = *(void***)g_pSwapChain;
+            if (scVt) {
+                AddWatchTarget(hDxgi, L"dxgi.dll", "IDXGISwapChain::Present",       scVt[8]);
+                AddWatchTarget(hDxgi, L"dxgi.dll", "IDXGISwapChain::GetBuffer",     scVt[9]);
+                AddWatchTarget(hDxgi, L"dxgi.dll", "IDXGISwapChain::ResizeBuffers", scVt[13]);
+                AddWatchTarget(hDxgi, L"dxgi.dll", "IDXGISwapChain1::Present1",     scVt[22]);
+            }
+        }
+
+        IDXGIFactory2* fac2 = nullptr;
+        typedef HRESULT(WINAPI* PFN_CreateDXGIFactory1)(REFIID, void**);
+        auto pCreateFac1 = (PFN_CreateDXGIFactory1)GetProcAddress(hDxgi, "CreateDXGIFactory1");
+        if (pCreateFac1 && SUCCEEDED(pCreateFac1(IID_PPV_ARGS(&fac2))) && fac2) {
+            void** facVt = *(void***)fac2;
+            if (facVt) {
+                AddWatchTarget(hDxgi, L"dxgi.dll", "IDXGIFactory2::CreateSwapChainForHwnd",        facVt[15]);
+                AddWatchTarget(hDxgi, L"dxgi.dll", "IDXGIFactory2::CreateSwapChainForComposition", facVt[24]);
+            }
+            fac2->Release();
+        }
+    }
+
+    HMODULE hD3d11 = GetModuleHandleW(L"d3d11.dll");
+    if (!hD3d11) hD3d11 = LoadLibraryW(L"d3d11.dll");
+    if (hD3d11) {
+        AddWatchTarget(hD3d11, L"d3d11.dll", "D3D11CreateDevice",             (const void*)GetProcAddress(hD3d11, "D3D11CreateDevice"));
+        AddWatchTarget(hD3d11, L"d3d11.dll", "D3D11CreateDeviceAndSwapChain", (const void*)GetProcAddress(hD3d11, "D3D11CreateDeviceAndSwapChain"));
+
+        if (g_pD3DCtx) {
+            void** ctxVt = *(void***)g_pD3DCtx;
+            if (ctxVt) {
+                AddWatchTarget(hD3d11, L"d3d11.dll", "ID3D11DeviceContext::Map",                   ctxVt[14]);
+                AddWatchTarget(hD3d11, L"d3d11.dll", "ID3D11DeviceContext::CopySubresourceRegion", ctxVt[46]);
+                AddWatchTarget(hD3d11, L"d3d11.dll", "ID3D11DeviceContext::CopyResource",          ctxVt[47]);
+            }
+        }
+    }
+}
+
+static LONG VerifyFileAuthenticode(const WCHAR* filePath, std::unordered_map<std::wstring, LONG>& cache)
+{
+    WCHAR upper[MAX_PATH] = L"";
+    wcsncpy_s(upper, filePath, _TRUNCATE);
+    UpperCaseWStr(upper);
+    std::wstring key(upper);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+
+    WINTRUST_FILE_INFO fileData = {};
+    fileData.cbStruct = sizeof(fileData);
+    fileData.pcwszFilePath = filePath;
+
+    GUID policyGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA wt = {};
+    wt.cbStruct = sizeof(wt);
+    wt.dwUIChoice = WTD_UI_NONE;
+    wt.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wt.dwUnionChoice = WTD_CHOICE_FILE;
+    wt.pFile = &fileData;
+    wt.dwStateAction = WTD_STATEACTION_VERIFY;
+    wt.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+    LONG status = WinVerifyTrust(NULL, &policyGuid, &wt);
+    wt.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, &policyGuid, &wt);
+
+    if (cache.size() > 1024) cache.clear();
+    cache[key] = status;
+    return status;
+}
+
+static void InspectTargetProcessIntegrityAndModules(
+    DWORD pid,
+    const WCHAR* winDirUpper,
+    size_t winDirLen,
+    std::unordered_map<std::wstring, LONG>& trustCache)
+{
+    HANDLE hProcLim = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcLim) return;
+
+    USHORT procMach = 0, nativeMach = 0;
+    BOOL wowOk = g_pIsWow64Process2 && g_pIsWow64Process2(hProcLim, &procMach, &nativeMach);
+    WCHAR exePath[MAX_PATH] = L"";
+    DWORD exeLen = MAX_PATH;
+    BOOL gotPath = QueryFullProcessImageNameW(hProcLim, 0, exePath, &exeLen);
+    CloseHandle(hProcLim);
+    if (!wowOk || procMach != IMAGE_FILE_MACHINE_UNKNOWN || !gotPath) return;
+
+    WCHAR exePathUpper[MAX_PATH] = L"";
+    wcsncpy_s(exePathUpper, exePath, _TRUNCATE);
+    UpperCaseWStr(exePathUpper);
+
+    const WCHAR* slashBase = wcsrchr(exePath, L'\\');
+    const WCHAR* exeBase = slashBase ? (slashBase + 1) : exePath;
+
+    /* Skip our own shield / GhostSwap even if accidentally seeded */
+    if (_wcsicmp(exeBase, L"AegisBlackout.exe") == 0 ||
+        _wcsicmp(exeBase, L"AegisBlackoutSvc.exe") == 0 ||
+        wcsstr(exePathUpper, L"GHOSTSWAP") != NULL) {
+        return;
+    }
+
+    /* 1. Surgical Anti-Inject DACL Lock */
+    HardenTargetProcessDacl(pid, exePathUpper);
+
+    /* Extract executable directory (including trailing backslash) for module origin filtering */
+    WCHAR exeDirUpper[MAX_PATH] = L"";
+    wcsncpy_s(exeDirUpper, exePathUpper, _TRUNCATE);
+    WCHAR* dirEnd = wcsrchr(exeDirUpper, L'\\');
+    if (dirEnd) dirEnd[1] = L'\0';
+    size_t exeDirLen = wcslen(exeDirUpper);
+
+    /* 2. Module snapshot + CoW / 16-byte prologue check + unsigned external DLL check */
+    HANDLE modSnap = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        modSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+        if (modSnap != INVALID_HANDLE_VALUE || GetLastError() != ERROR_BAD_LENGTH) break;
+        Sleep(10);
+    }
+    if (modSnap == INVALID_HANDLE_VALUE) return;
+
+    const BYTE* rWin32u = NULL; DWORD szWin32u = 0;
+    const BYTE* rDxgi   = NULL; DWORD szDxgi   = 0;
+    const BYTE* rD3d11  = NULL; DWORD szD3d11  = 0;
+
+    MODULEENTRY32W me = {};
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(modSnap, &me)) {
+        do {
+            if (_wcsicmp(me.szModule, L"win32u.dll") == 0) {
+                rWin32u = me.modBaseAddr; szWin32u = me.modBaseSize;
+            } else if (_wcsicmp(me.szModule, L"dxgi.dll") == 0) {
+                rDxgi = me.modBaseAddr; szDxgi = me.modBaseSize;
+            } else if (_wcsicmp(me.szModule, L"d3d11.dll") == 0) {
+                rD3d11 = me.modBaseAddr; szD3d11 = me.modBaseSize;
+            }
+
+            /* Skip main .exe and check only external .dll modules */
+            WCHAR modUpper[MAX_PATH] = L"";
+            wcsncpy_s(modUpper, me.szExePath, _TRUNCATE);
+            UpperCaseWStr(modUpper);
+            size_t modLen = wcslen(modUpper);
+            if (modLen > 4 && _wcsicmp(modUpper + modLen - 4, L".DLL") == 0) {
+                BOOL inWinDir = (winDirLen > 0 && _wcsnicmp(modUpper, winDirUpper, winDirLen) == 0);
+                BOOL inExeDir = (exeDirLen > 0 && _wcsnicmp(modUpper, exeDirUpper, exeDirLen) == 0);
+                if (!inWinDir && !inExeDir) {
+                    LONG trustSt = VerifyFileAuthenticode(me.szExePath, trustCache);
+                    if (trustSt != ERROR_SUCCESS) {
+                        char dllUtf8[MAX_PATH * 2] = "";
+                        WideCharToMultiByte(CP_UTF8, 0, me.szExePath, -1, dllUtf8, sizeof(dllUtf8) - 1, NULL, NULL);
+                        char detail[640], dedup[192];
+                        sprintf_s(detail, sizeof(detail), "trust=0x%08lX dll=%s", (unsigned long)trustSt, dllUtf8);
+                        sprintf_s(dedup, sizeof(dedup), "UDLL_%lu_%ls", pid, me.szModule);
+                        EmitSecurityAlert("UNSIGNED_DLL", pid, exeBase, detail, dedup);
+                    }
+                }
+            }
+        } while (Module32NextW(modSnap, &me));
+    }
+    CloseHandle(modSnap);
+
+    if (g_watchTargets.empty()) return;
+
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProc) return;
+
+    for (const auto& t : g_watchTargets) {
+        const BYTE* rBase = NULL;
+        DWORD rSize = 0;
+        if (_wcsicmp(t.modName, L"win32u.dll") == 0) {
+            rBase = rWin32u; rSize = szWin32u;
+        } else if (_wcsicmp(t.modName, L"dxgi.dll") == 0) {
+            rBase = rDxgi; rSize = szDxgi;
+        } else if (_wcsicmp(t.modName, L"d3d11.dll") == 0) {
+            rBase = rD3d11; rSize = szD3d11;
+        }
+        if (!rBase || t.rva + 16 > rSize) continue;
+
+        const BYTE* rAddr = rBase + t.rva;
+        BYTE remoteBytes[16] = {};
+        SIZE_T nRead = 0;
+        if (!ReadProcessMemory(hProc, rAddr, remoteBytes, 16, &nRead) || nRead != 16) continue;
+
+        if (memcmp(remoteBytes, t.cleanBytes, 16) != 0) {
+            PSAPI_WORKING_SET_EX_INFORMATION ws = {};
+            ws.VirtualAddress = (PVOID)((ULONG_PTR)rAddr & ~(ULONG_PTR)0xFFFULL);
+            int cow = 0;
+            if (QueryWorkingSetEx(hProc, &ws, sizeof(ws))) {
+                if (ws.VirtualAttributes.Valid && !ws.VirtualAttributes.Shared) cow = 1;
+            }
+            char detail[220], dedup[192];
+            sprintf_s(detail, sizeof(detail),
+                "%ls!%s CoW=%d bytes=%02X %02X %02X %02X %02X %02X %02X %02X",
+                t.modName, t.funcName, cow,
+                remoteBytes[0], remoteBytes[1], remoteBytes[2], remoteBytes[3],
+                remoteBytes[4], remoteBytes[5], remoteBytes[6], remoteBytes[7]);
+            sprintf_s(dedup, sizeof(dedup), "IHOOK_%lu_%s", pid, t.funcName);
+            EmitSecurityAlert("INLINE_HOOK", pid, exeBase, detail, dedup);
+        }
+    }
+
+    CloseHandle(hProc);
+}
+
+static DWORD WINAPI SentinelThreadProc(LPVOID param)
+{
+    (void)param;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+    WCHAR winDirUpper[MAX_PATH] = L"";
+    UINT wlen = GetWindowsDirectoryW(winDirUpper, MAX_PATH - 2);
+    if (wlen > 0 && wlen < MAX_PATH - 2) {
+        if (winDirUpper[wlen - 1] != L'\\') {
+            winDirUpper[wlen++] = L'\\';
+            winDirUpper[wlen] = L'\0';
+        }
+        UpperCaseWStr(winDirUpper);
+    } else {
+        wcscpy_s(winDirUpper, L"C:\\WINDOWS\\");
+        wlen = (UINT)wcslen(winDirUpper);
+    }
+
+    std::unordered_map<std::wstring, LONG> trustCache;
+    ULONGLONG lastScanTick = 0;
+
+    HANDLE waitHandles[2] = { g_hSentinelStopEv, g_hAlertEvent };
+    DWORD waitCount = g_hAlertEvent ? 2 : 1;
+
+    while (true) {
+        ULONGLONG now = GetTickCount64();
+        if (now - lastScanTick >= 1500ULL) {
+            lastScanTick = now;
+
+            std::vector<DWORD> seeds;
+            if (g_monitoredCsInit) {
+                EnterCriticalSection(&g_monitoredCs);
+                seeds.assign(g_monitoredSeeds, g_monitoredSeeds + g_monitoredSeedCount);
+                LeaveCriticalSection(&g_monitoredCs);
+            }
+
+            struct ProcNode {
+                DWORD pid;
+                DWORD ppid;
+                WCHAR exeName[64];
+            };
+            std::vector<ProcNode> allProcs;
+            std::vector<DWORD> alivePids;
+
+            HANDLE pSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (pSnap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W pe = {};
+                pe.dwSize = sizeof(pe);
+                if (Process32FirstW(pSnap, &pe)) {
+                    do {
+                        alivePids.push_back(pe.th32ProcessID);
+                        ProcNode n = {};
+                        n.pid = pe.th32ProcessID;
+                        n.ppid = pe.th32ParentProcessID;
+                        wcsncpy_s(n.exeName, pe.szExeFile, _TRUNCATE);
+                        allProcs.push_back(n);
+                    } while (Process32NextW(pSnap, &pe));
+                }
+                CloseHandle(pSnap);
+            }
+
+            PruneDeadHardenedDacls(alivePids);
+
+            /* Expand monitored PIDs: cloaked parents + same-exe child processes (2 hops, e.g. Chrome GPU) */
+            std::vector<DWORD> monitored = seeds;
+            for (int hop = 0; hop < 2; hop++) {
+                size_t curSize = monitored.size();
+                for (size_t si = 0; si < curSize; si++) {
+                    DWORD parentPid = monitored[si];
+                    const WCHAR* parentExe = NULL;
+                    for (const auto& p : allProcs) {
+                        if (p.pid == parentPid) { parentExe = p.exeName; break; }
+                    }
+                    if (!parentExe) continue;
+                    for (const auto& c : allProcs) {
+                        if (c.ppid == parentPid && _wcsicmp(c.exeName, parentExe) == 0) {
+                            if (std::find(monitored.begin(), monitored.end(), c.pid) == monitored.end()) {
+                                monitored.push_back(c.pid);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (DWORD mpid : monitored) {
+                if (WaitForSingleObject(g_hSentinelStopEv, 0) == WAIT_OBJECT_0) break;
+                InspectTargetProcessIntegrityAndModules(mpid, winDirUpper, (size_t)wlen, trustCache);
+            }
+        }
+
+        DWORD wr = WaitForMultipleObjects(waitCount, waitHandles, FALSE, 1500);
+        if (wr == WAIT_OBJECT_0 || wr == WAIT_FAILED) {
+            break;
+        }
+        if (waitCount == 2 && wr == WAIT_OBJECT_0 + 1) {
+            CheckExternalAlertIpcFile();
+        }
+    }
+
+    return 0;
+}
+
+static void StartSentinelSystem(void)
+{
+    EnsureAlertEventCreated();
+    InitSentinelWatchTargets();
+    g_hSentinelStopEv = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (g_hSentinelStopEv) {
+        g_hSentinelThread = CreateThread(NULL, 0, SentinelThreadProc, NULL, 0, NULL);
+        g_bSentinelActive = (g_hSentinelThread != NULL);
+    }
+}
+
+static void StopSentinelSystem(void)
+{
+    if (g_hSentinelStopEv) SetEvent(g_hSentinelStopEv);
+    if (g_hSentinelThread) {
+        WaitForSingleObject(g_hSentinelThread, 2000);
+        CloseHandle(g_hSentinelThread);
+        g_hSentinelThread = NULL;
+    }
+    if (g_hSentinelStopEv) {
+        CloseHandle(g_hSentinelStopEv);
+        g_hSentinelStopEv = NULL;
+    }
+    if (g_hAlertEvent) {
+        CloseHandle(g_hAlertEvent);
+        g_hAlertEvent = NULL;
+    }
+    g_bSentinelActive = FALSE;
+}
+
 static void HardenProcessSecurity(void)
 {
     /*
@@ -953,7 +1986,7 @@ static void EnsureCurtainIntegrity(void)
     HWND prev = GetWindow(g_hCurtain, GW_HWNDPREV);
     int hops = 0;
     while (prev && hops++ < 32) {
-        if (prev != g_hCanvasWnd && IsWindowVisible(prev)) {
+        if (prev != g_hCanvasWnd && prev != g_hAlertWnd && IsWindowVisible(prev)) {
             RECT prc = { 0 };
             if (GetWindowRect(prev, &prc) &&
                 (prc.right - prc.left) > 1 &&
@@ -980,6 +2013,10 @@ static void EnsureCurtainIntegrity(void)
             SetWindowDisplayAffinity(g_hCanvasWnd, WDA_MONITOR);
             SetWindowPos(g_hCanvasWnd, HWND_TOPMOST, g_vx, g_vy, g_vw, g_vh, SWP_SHOWWINDOW);
         }
+        if (g_hAlertWnd && IsWindowVisible(g_hAlertWnd)) {
+            SetWindowDisplayAffinity(g_hAlertWnd, WDA_MONITOR);
+            SetWindowPos(g_hAlertWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        }
     }
 }
 
@@ -989,7 +2026,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd,
     (void)hHook; (void)dwEventThread; (void)dwmsEventTime; (void)idChild;
     if (g_bInternalUnmasking || !g_hCurtain) return;
     if (idObject != OBJID_WINDOW || !hwnd) return;
-    if (hwnd == g_hCurtain || hwnd == g_hCanvasWnd) return;
+    if (hwnd == g_hCurtain || hwnd == g_hCanvasWnd || hwnd == g_hAlertWnd) return;
 
     if (event == EVENT_SYSTEM_FOREGROUND ||
         (event == EVENT_OBJECT_SHOW && (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST))) {
@@ -1043,6 +2080,9 @@ static BOOL TakePrivilegedSnapshot(void)
 
     /* Ultra-tight internal unmask window bounded strictly by DwmFlush() */
     g_bInternalUnmasking = TRUE;
+    if (g_hAlertWnd && IsWindowVisible(g_hAlertWnd)) {
+        ShowWindow(g_hAlertWnd, SW_HIDE);
+    }
     RestoreAllCloakedWindows(FALSE);
     if (g_bHwDrmActive && g_pDCompVisual && g_pDCompDev) {
         g_pDCompVisual->SetContent(nullptr);
@@ -1437,6 +2477,8 @@ static void ShowSnippingCanvas(void)
 static void CleanShutdown(UINT exitCode)
 {
     g_bInternalUnmasking = TRUE;
+    StopSentinelSystem();
+    RestoreAllTargetDacls();
     RestoreAllCloakedWindows(TRUE);
     if (g_hWinEventFg)     { UnhookWinEvent(g_hWinEventFg);     g_hWinEventFg = NULL; }
     if (g_hWinEventShow)   { UnhookWinEvent(g_hWinEventShow);   g_hWinEventShow = NULL; }
@@ -1446,9 +2488,11 @@ static void CleanShutdown(UINT exitCode)
         KillTimer(g_hCurtain, TIMER_WATCHDOG_ID);
         KillTimer(g_hCurtain, TIMER_HWDRM_HEARTBEAT);
         KillTimer(g_hCurtain, TIMER_CLOAK_SWEEP_ID);
+        KillTimer(g_hCurtain, TIMER_ALERT_HIDE_ID);
     }
     ReleaseHwDrmOverlay();
     ReleaseAndScrubSnapshots();
+    if (g_hAlertWnd)  { DestroyWindow(g_hAlertWnd);  g_hAlertWnd = NULL; }
     if (g_hCanvasWnd) { DestroyWindow(g_hCanvasWnd); g_hCanvasWnd = NULL; }
     if (g_hInputWnd)  { DestroyWindow(g_hInputWnd);  g_hInputWnd = NULL; }
     if (g_hCurtain) {
@@ -1586,6 +2630,10 @@ LRESULT CALLBACK CurtainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         EnsureCurtainIntegrity();
         return 0;
 
+    case WM_APP_SECURITY_ALERT:
+        ShowOrRefreshAlertHud();
+        return 0;
+
     case WM_DISPLAYCHANGE:
     case WM_DPICHANGED:
         EnsureCurtainIntegrity();
@@ -1600,6 +2648,9 @@ LRESULT CALLBACK CurtainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
         } else if (wParam == TIMER_CLOAK_SWEEP_ID) {
             SweepAndCloakWindows();
+        } else if (wParam == TIMER_ALERT_HIDE_ID) {
+            KillTimer(hwnd, TIMER_ALERT_HIDE_ID);
+            if (g_hAlertWnd) ShowWindow(g_hAlertWnd, SW_HIDE);
         }
         return 0;
     }
@@ -1612,8 +2663,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_hInst = hInst;
+    InitializeCriticalSection(&g_alertCs);     g_alertCsInit = TRUE;
+    InitializeCriticalSection(&g_daclCs);      g_daclCsInit = TRUE;
+    InitializeCriticalSection(&g_monitoredCs); g_monitoredCsInit = TRUE;
 
-    StartupLog("AegisBlackout v4.1.0 startup begin (DPI Aware v2, 24x7 HwDRM + Global No-Whitelist Special-APC WDA=0x11 + Zero-Silent, Ctrl+Alt+Q)", TRUE);
+    StartupLog("AegisBlackout v4.2.0 startup begin (DPI Aware v2, 24x7 HwDRM + Global Special-APC WDA=0x11 + Anti-Inject DACL + CoW/InlineHook/WDA/UnsignedDLL Sentinel, Ctrl+Alt+Q)", TRUE);
 
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\DwmCompHelper_Mtx_a9e1");
     if (!hMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -1717,9 +2771,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
         rawOk = RegisterRawInputDevices(rids, 2, sizeof(RAWINPUTDEVICE));
     }
 
-    /* 3. Active Topmost Watchdog (100ms) + 24x7 HW-DRM Heartbeat (1000ms) + Per-Window Special-APC Cloak (50ms + Event-Driven) */
+    /* 3. Active Topmost Watchdog (100ms) + 24x7 HW-DRM Heartbeat (1000ms) + Per-Window Special-APC Cloak (50ms) + Sentinel */
     InitPerWindowCloak();
     SweepAndCloakWindows();
+    StartSentinelSystem();
     SetTimer(g_hCurtain, TIMER_WATCHDOG_ID, 100, NULL);
     SetTimer(g_hCurtain, TIMER_CLOAK_SWEEP_ID, 50, NULL);
     if (g_bHwDrmActive) {
@@ -1751,6 +2806,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
         (unsigned)WDA_EXCLUDEFROMCAPTURE);
     StartupLog(cloakLog, FALSE);
 
+    char sentLog[160];
+    sprintf_s(sentLog, sizeof(sentLog),
+        "Sentinel: active=%d watchTargets=%zu alertEvent=%d",
+        g_bSentinelActive ? 1 : 0, g_watchTargets.size(), g_hAlertEvent ? 1 : 0);
+    StartupLog(sentLog, FALSE);
+
     char summary[160];
     sprintf_s(summary, sizeof(summary),
         "Ready: WDA=%d RawInput=%d WinEvent=(%p,%p,%p) Bounds=(%d,%d,%dx%d)",
@@ -1763,8 +2824,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
         DispatchMessageW(&msg);
     }
 
+    StopSentinelSystem();
+    RestoreAllTargetDacls();
     ReleaseHwDrmOverlay();
     ReleaseAndScrubSnapshots();
+    if (g_monitoredCsInit) DeleteCriticalSection(&g_monitoredCs);
+    if (g_daclCsInit)      DeleteCriticalSection(&g_daclCs);
+    if (g_alertCsInit)     DeleteCriticalSection(&g_alertCs);
     CloseHandle(hMutex);
     if (hDesk) CloseDesktop(hDesk);
     return (int)msg.wParam;

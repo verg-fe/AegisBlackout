@@ -61,6 +61,12 @@ struct GhostStubData {
     GUID iidD3D11Texture2D;
     GUID iidDXGISwapChain1;
 
+    /* VTable ownership sentinel bounds (populated per-target in AttachToTarget) */
+    uint64_t dxgiBase;
+    uint64_t dxgiEnd;
+    uint64_t gpicBase;
+    uint64_t gpicEnd;
+
     /* Live atomic telemetry */
     volatile LONG totalCreateCalls;
     volatile LONG upgraded420;            /* Primary upgrades (0x20 in v2 or 0x420 if --hw-protected) */
@@ -72,6 +78,9 @@ struct GhostStubData {
     volatile LONG verifiedDisplayOnly;    /* Actual SwapChain Desc1.Flags & 0x20 */
     volatile LONG presentCalls;
     volatile LONG deviceResetInjected;
+    volatile LONG     vtableTamperCount;
+    volatile uint32_t lastTamperSlot;
+    volatile uint64_t lastTamperAddr;
 
     volatile LONG lastHr;
     volatile LONG lastOrigFlags;

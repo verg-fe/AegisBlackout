@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 echo ====================================================================
-echo   AegisBlackout v4.1.0 - x64 MSVC Static Build
+echo   AegisBlackout v4.2.0 - x64 MSVC Static Build
 echo ====================================================================
 
 set "VCVARS="
@@ -50,7 +50,7 @@ echo [1/5] Compiling build\AegisBlackout.exe ...
 cl /nologo /utf-8 /EHsc /O2 /MT /W3 /DUNICODE /D_UNICODE ^
     "src\AegisBlackout.cpp" ^
     /Fe:"build\AegisBlackout.exe" /Fo:"build\AegisBlackout.obj" ^
-    /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib dwmapi.lib d3d11.lib dxgi.lib dcomp.lib advapi32.lib bcrypt.lib shell32.lib
+    /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib dwmapi.lib d3d11.lib dxgi.lib dcomp.lib advapi32.lib bcrypt.lib shell32.lib psapi.lib wintrust.lib crypt32.lib
 if %errorlevel% neq 0 exit /b 1
 
 echo.

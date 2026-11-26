@@ -1,13 +1,18 @@
-# AegisBlackout (黑幕神盾) v4.1.0
+# AegisBlackout (黑幕神盾) v4.2.0
 
-**Windows 11 24×7 GPU 硬件 DRM (`HW_PROTECTED | DISPLAY_ONLY`) + 全局无白名单 Special-APC 单窗隐身 (`WDA_EXCLUDEFROMCAPTURE`) + `GhostSwap v2.1` Fileless PIC / 0%频闪防拍黑幕 + `AegisVault` 隔离浏览 + Ring-0 UIPI (`High-IL`) & `SYSTEM` 自愈守护**
+**Windows 11 24×7 GPU 硬件 DRM (`HW_PROTECTED | DISPLAY_ONLY`) + 全局无白名单 Special-APC 单窗隐身 (`WDA_EXCLUDEFROMCAPTURE`) + 主动防御实时哨兵 (Target Anti-Inject DACL + CoW/InlineHook/WDA/UnsignedDLL/VTable) + `GhostSwap v2.2` Fileless PIC & 0%频闪防拍黑幕 + `AegisVault` 隔离浏览 + Ring-0 UIPI (`High-IL`) & `SYSTEM` 自愈守护**
 
-> **Zero Custom `.sys` Driver | VBS / HVCI & ACG / CFG Compatible | Global No-Whitelist Zero-Snow | Zero Hotkey Interference (`Ctrl+Alt+Q` Physical HID) | Cooperative Shield Mode**
+> **Zero Custom `.sys` Driver | VBS / HVCI & ACG / CFG Compatible | Target Process Anti-Inject DACL | Real-Time CoW / Inline Hook / Unsigned DLL / VTable Sentinel | Zero Hotkey Interference (`Ctrl+Alt+Q` Physical HID)**
 
-AegisBlackout 是一个面向 Windows 11 的零内核驱动隐私防窥、防截屏与防录屏框架。**v4.1.0 在 v4.0 零注入 `NtQueueApcThreadEx2` (`QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC`) + `win32u!NtUserSetWindowDisplayAffinity` 的基础上完成三项核心进化**：
-1. **全局无白名单零雪花单窗隐身（`AegisBlackout v4.1.0`）**：移除微信/QQ/终端等宿主限制，引入 `EVENT_OBJECT_CREATE/SHOW/LOCATIONCHANGE` 瞬时唤醒、`50ms` 快巡检与 `3` 次瞬态重试容错，新打开的 Chrome / Edge / Electron / Weixin / QQ 等全部 x64 程序毫秒自动隐身（`V11/V18 -> 0.00%` 且零雪花），并将 `Ctrl+Alt+Q` 截图前摘幕校验加固至 `150ms` 轮询 + 3× `DwmFlush()`，保证**全软件 0.00% 外部泄漏的同时，物理键 `Ctrl+Alt+Q` 仍可完整清晰截图**。
-2. **`GhostSwap v2.1` 无文件 PIC DXGI 升维引擎与一键防偷拍黑幕**：内嵌纯 `.gpic` 位置无关代码（0 重定位、16 字节对齐，并通过 `SetProcessValidCallTargets` 注册 CFG 合法跳转目标），实证定位 AMD RX 9070 下 `0x420` 对 Chrome (`BGRA8 + Usage=0x30 SRV`) 产生雪花屏、而对微信 (`RGBA8`) 无雪花的底层根因，提出通用的零雪花 `0x20 DISPLAY_ONLY` 方案；默认以**协同护盾模式**（0% 进程注入、0 冲突，提供 `Ctrl+Alt+F9/F10/F11` **0% 频闪、0% 空闲占用的 100%/85%/65% 一键防手机偷拍黑幕**）无感驻留后台，也支持 `--lock-vram` 一键切换为连 `Ctrl+Alt+Q` 也截黑的极端显存焊死模式。
-3. **`AegisVault` 独立硬件加密浏览沙箱**：内置基于 D3D11/D3D12 `0x420` 硬件保护表面的离线密保图/文档查看器。
+AegisBlackout 是一个面向 Windows 11 的零内核驱动隐私防窥、防截屏与主动完整性防御框架。**v4.2.0 在 v4.1.0 全局无白名单单窗隐身与 24×7 GPU 硬件 DRM 基础上，新增第六层「实时主动防御与完整性哨兵」及兼容性加固**：
+1. **外科手术级目标进程防注入 DACL 锁与 CoW/InlineHook/未签名DLL/WDA 实时哨兵（`AegisBlackout v4.2.0`）**：
+   - 自动剥离受保护桌面进程（含 Chromium 2 跳子进程，跳过系统/Shell/终端/IDE/反作弊/沙箱进程）对非 `SYSTEM` / 非 `Administrators` 主体的危险句柄权限（`PROCESS_VM_WRITE | VM_OPERATION | VM_READ | CREATE_THREAD | DUP_HANDLE | SET_INFORMATION | WRITE_DAC | WRITE_OWNER`），阻断同桌面普通进程跨进程注入或读内存，并在紧急退出（`Ctrl+Alt+Shift+End`）时**干净还原原始安全描述符**；
+   - 后台守护哨兵（`1500ms` 定时巡检 + IPC 事件即时唤醒）实时核验 `win32u.dll` / `dxgi.dll` / `d3d11.dll` 关键导出与 COM 虚表方法 共 `15` 个目标的 `16` 字节序言及 `QueryWorkingSetEx` 写时复制（`CoW`）页属性、缓存式 `WinVerifyTrust` 外部未签名 `.dll` 载荷、以及经过窗口可见性/尺寸/Grace 消抖调优的 `WDA_TAMPER` 与 `win32u` 存根劫持，命中立即写入可执行目录 `aegis_security_alerts.log` 并弹出顶层受 `WDA_MONITOR` 保护的红色非阻塞告警 HUD。
+2. **`GhostSwap v2.2` DXGI 虚表归属实时哨兵 + Win11 Shell 子树 / Sandboxie `SbieDll.dll` 豁免加固**：
+   - 内嵌纯 `.gpic` 位置无关代码（`0` 重定位、`16` 字节对齐，并注册 CFG 合法跳转目标），在 `Present` / `Present1` 与 `500ms` 驻留轮询中双向校验共享与实例 DXGI 虚表槽位归属 `[dxgiBase, dxgiEnd) ∪ [gpicBase, gpicEnd)`，发现第三方篡改立即通过 `Local\AegisBlackout_SecurityAlert_Ev` 向护盾弹窗告警并**自动自愈还原指针**；
+   - 新增 `HasExcludedShellHostAncestor` 精准豁免 `SearchHost.exe` / `StartMenuExperienceHost.exe` 等 Win11 系统外壳的 `msedgewebview2.exe` 子树（修复 Windows 11 开始菜单搜索全白/截屏黑窗问题，同时不影响 `explorer.exe` 普通应用），并按模块列表识别 `SbieDll.dll` 主动避让 Sandboxie 沙箱内进程（防止沙箱 GPU 进程触发 `gpu_process_host` 异常）。
+3. **全局无白名单零雪花单窗隐身 & `AegisVault` 硬件加密浏览沙箱**：
+   - 延续 `NtQueueApcThreadEx2` (`SPECIAL_USER_APC`) + `win32u!NtUserSetWindowDisplayAffinity` 零注入方案、默认**协同护盾模式**（`Ctrl+Alt+F9/F10/F11` **0% 频闪、0% 空闲 GPU 占用瞬间防拍黑幕**）、以及 `AegisVault` (`0x420 HW_PROTECTED`) 离线密保看图舱。
 
 ---
 
@@ -33,26 +38,30 @@ AegisBlackout 是一个面向 Windows 11 的零内核驱动隐私防窥、防截
 
 ## English Overview
 
-**AegisBlackout v4.1.0** is a driverless Windows 11 anti-screen-capture, anti-recording, and privacy curtain framework designed for VBS/HVCI, ACG/CIG/CFG, and competitive gaming/anti-cheat environments:
+**AegisBlackout v4.2.0** is a driverless Windows 11 anti-screen-capture, anti-recording, and active integrity defense framework designed for VBS/HVCI, ACG/CIG/CFG, and competitive gaming/anti-cheat environments:
 
 - **24×7 GPU Hardware-Protected DRM Overlay**: Creates a fullscreen `DirectComposition` (`IDCompositionDevice`) swap chain with `DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED | DXGI_SWAP_CHAIN_FLAG_DISPLAY_ONLY` (`0x420`) backed by hardware-protected VRAM (`D3D11_RESOURCE_MISC_HW_PROTECTED`), gracefully falling back to `WS_EX_LAYERED` when unsupported.
-- **Global No-Whitelist Zero-Injection Special-APC Cloak (Upgraded in v4.1.0)**: Uses `NtQueueApcThreadEx2(..., QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC, win32u!NtUserSetWindowDisplayAffinity, hwnd, WDA_EXCLUDEFROMCAPTURE, NULL)` directly on Microsoft-signed `win32u` syscall stubs — zero remote DLLs, zero remote allocations, zero `WriteProcessMemory`. Expanded globally across Chrome, Edge, Electron, WeChat/Weixin, QQ, terminals, and newly launched apps via `50ms` sweeps, `EVENT_OBJECT_CREATE` + `SHOW` + `LOCATIONCHANGE` hooks, and 3-attempt transient retry tolerance. Hardened `Ctrl+Alt+Q` capture unmasking (`150ms` affinity poll + 3× `DwmFlush()`) preserves clean privileged self-capture while keeping external captures at **0.00%**.
-- **GhostSwap v2.1 (Fileless `.gpic` PIC Engine + 0%-Flicker Privacy Veil)**: Includes a relocation-free, 16-byte-aligned `.gpic` DXGI swap-chain vtable upgrader compatible with ACG/CIG (`NoRemoteImages`, `DynamicCode` policies permitting) and CFG (`SetProcessValidCallTargets`). Resolves AMD RX 9070 `BGRA8` vs `RGBA8` `HW_PROTECTED` snow artifacts using universal zero-snow `0x20 DISPLAY_ONLY`. Runs by default in **Cooperative Shield Mode** alongside `AegisBlackout v4.1.0` providing an event-driven 0%-flicker / 0%-idle-GPU solid blackout/dimmer veil (`Ctrl+Alt+F9/F10/F11`), with `--lock-vram` available for extreme lockout.
+- **Global No-Whitelist Zero-Injection Special-APC Cloak**: Uses `NtQueueApcThreadEx2(..., QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC, win32u!NtUserSetWindowDisplayAffinity, hwnd, WDA_EXCLUDEFROMCAPTURE, NULL)` directly on Microsoft-signed `win32u` syscall stubs — zero remote DLLs, zero remote allocations, zero `WriteProcessMemory`. Hardened `Ctrl+Alt+Q` capture unmasking (`150ms` affinity poll + 3× `DwmFlush()`) preserves clean privileged self-capture while keeping external captures at **0.00%**.
+- **Layer 6: Real-Time Active Defense & Integrity Sentinel (New in v4.2.0)**:
+  - **Surgical Target Process Anti-Inject DACL Lock**: Strips `PROCESS_VM_WRITE | VM_OPERATION | VM_READ | CREATE_THREAD | DUP_HANDLE | SET_INFORMATION | WRITE_DAC | WRITE_OWNER` from non-`SYSTEM`/non-`Administrators` ACEs on monitored targets (automatically restoring original security descriptors on clean shutdown).
+  - **Real-Time CoW / Inline Hook / Unsigned DLL / WDA Sentinel**: `SentinelThread` (`1500ms` sweep + 2-hop child expansion) checks 16-byte prologues and `QueryWorkingSetEx` Copy-on-Write across 15 `win32u`/`dxgi`/`d3d11` entrypoints & COM vtables, runs cached `WinVerifyTrust` Authenticode checks on external DLLs, and catches sustained `WDA` stripping or `win32u` stub hijacking — logging to `aegis_security_alerts.log` and raising a topmost non-blocking `WDA_MONITOR` red HUD.
+  - **`GhostSwap v2.2` DXGI VTable Sentinel & Shell/Sandboxie Hardening**: Fileless `.gpic` engine (`0` relocations, 16-byte aligned, CFG registered) now verifies per-object and shared DXGI vtable ownership (`500ms` resident poll -> auto-heal + IPC alert to `AegisBlackout`). `HasExcludedShellHostAncestor` exempts Windows 11 shell WebView2 subtrees (`SearchHost.exe`, `StartMenuExperienceHost.exe`, `Widgets.exe`, etc.), and `SbieDll.dll` module detection prevents hooking inside Sandboxie boxes.
 - **AegisVault (`src/AegisVault.cpp`)**: Standalone `HW_PROTECTED` GPU-encrypted media viewer.
 - **Ring-0 `win32k.sys` UIPI + `NT AUTHORITY\SYSTEM` Watchdog**: Hardened LocalSystem service (`AegisBlackoutGuard`) launches `AegisBlackout.exe` at **High Integrity Level** in `winsta0\default` with zero UAC prompts at boot, strict process DACL, `ProcessExtensionPointDisablePolicy`, `ProcessImageLoadPolicy`, and NTFS read-only ACLs.
 - **Zero-Silent Hardware-Only Raw Input**: Passive `RegisterRawInputDevices` (`RIDEV_INPUTSINK`) verifies physical HID/ACPI/USB device handles — blocking synthetic `SendInput` / `keybd_event` / RDP spoofing while registering zero hotkeys in `AegisBlackout.exe`.
 
 ---
 
-## 五层防御体系架构
+## 六层防御体系架构
 
 | 防御维度 | 底层机制 | 安全效果 |
 | :--- | :--- | :--- |
 | **第一层：24×7 GPU 硬件 DRM** | `D3D11` + `DirectComposition` + `DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED \| DISPLAY_ONLY` | 显存开启硬件内容加密；DXGI 桌面复制触发 `ProtectedContentMaskedOut`，`DwmGetDxSharedSurface` 拒绝导出句柄 |
 | **第二层：DWM 全屏双锁幕布** | 全屏置顶 `WDA_MONITOR` + `WS_EX_NOREDIRECTIONBITMAP` + `WS_EX_TRANSPARENT` + 100ms 看门狗 | 完全穿透点击不影响操作；GDI `BitBlt` / `GetPixel` / `PrintWindow` / WGC Monitor 均捕获纯黑；自动压回抢置顶弹窗 |
-| **第三层：零注入单窗隐身 (v4 新增)** | `NtQueueApcThreadEx2` (`SPECIAL_USER_APC`) -> `win32u!NtUserSetWindowDisplayAffinity(0x11)` | 零 DLL/Shellcode/远线程/远程内存分配，兼容 Chromium ACG/CFG；宿主机 `PW_RENDERFULLCONTENT` 降至 `0.00%`，`WGC CreateForWindow` 降至 `0.00%–0.42%`；`Ctrl+Alt+Q` 时原子临时摘除并在退出时干净还原 |
+| **第三层：零注入单窗隐身** | `NtQueueApcThreadEx2` (`SPECIAL_USER_APC`) -> `win32u!NtUserSetWindowDisplayAffinity(0x11)` | 零 DLL/Shellcode/远线程/远程内存分配，兼容 Chromium ACG/CFG；宿主机 `PW_RENDERFULLCONTENT` 降至 `0.00%`，`WGC CreateForWindow` 降至 `0.00%–0.42%`；`Ctrl+Alt+Q` 时原子临时摘除并在退出时干净还原 |
 | **第四层：Ring-0 UIPI + 内核自卫** | `SYSTEM` 服务托管拉起 `High-IL` + `D:P` 进程 DACL + `ExtPt`/`ImgLoad` 缓解 + NTFS 只读锁 | 宿主机普通（Medium-IL）软件 `OpenProcess(TERMINATE/VM_READ/VM_WRITE)` 全部 `ERROR_ACCESS_DENIED (5)`；阻断跨权限窗口控制 |
 | **第五层：零静默物理门禁截屏** | `RegisterRawInputDevices` 校验物理 HID 句柄 + `>=150ms` 可视 HUD 门禁 + `SecureZeroMemory` 擦除 | 彻底杜绝静默/后台代码触发截屏；必须人类物理按 `Ctrl + Alt + Q` 并双击或按 `Enter` 确认，关闭瞬间安全清零 4K 内存缓冲 |
+| **第六层：主动防御与完整性哨兵 (v4.2.0)** | 目标进程 `DACL` 防注入锁 + `QueryWorkingSetEx` CoW/16B 序言核验 + `WinVerifyTrust` + `GhostSwap v2.2` VTable 自愈 | 普通进程向受保护目标 `OpenProcess(VM_WRITE \| VM_READ \| CREATE_THREAD)` 返回 `err=5`；Inline Hook、未签名外部 DLL、WDA 强摘、DXGI 虚表劫持均被毫秒告警或自动自愈 |
 
 ---
 
@@ -90,22 +99,42 @@ AegisBlackout 是一个面向 Windows 11 的零内核驱动隐私防窥、防截
 | `V27` | 600×600 高亮红色 `WS_EX_TOPMOST` 抢置顶劫持 | **PASS**（瞬间压回底层，GDI/DXGI 漏光均 `0.00%`） |
 | `V29` | **独立 D3D11 设备 `CopyResource` 与硬件 DRM 密文实证** | **PASS**：`0x420` 交换链无法导出共享句柄 (`0x80070057`)，同设备及跨独立 Device B (`OpenSharedResource1`) 强制 `CopyResource -> Map` 均只读出高熵硬件密文（`0/16384` 明文匹配，`4096+` 杂乱像素；未保护对照组为 `16384/16384` 纯明文） |
 
+### Group F：GPU 显存直读与传统 Blt-Model (`DISCARD`) 边界实证（RX 9070）
+
+| 实验项 | 目标渲染链 / 抓取接口 | 实测像素状态 | 结论 |
+| :--- | :--- | :--- | :--- |
+| `EXP-1A/1B/1C` | `DXGI DuplicateOutput` / `DuplicateOutput1` / `D3D9 GetFrontBufferData` | **0.00%** | 系统级复制管线完整拦截 |
+| `EXP-2A` | 传统 Blt-Model (`DXGI_SWAP_EFFECT_DISCARD`) + `WDA=0x11` 下调用 `DwmGetDxSharedSurface` | **100.00% 泄漏** | 传统非 Flip 窗口受此 DWM 接口结构性限制 |
+| `EXP-2B/2C/2D` | Chrome / Flip-Model (`FLIP_DISCARD`) / `0x420` 窗口调用 `DwmGetDxSharedSurface` | **0.00%** (`0xC026200B` 或全黑) | 现代合成与 DComp 管线完全隔离 |
+| `EXP-3C / 4B` | 原生 `0x420 HW_PROTECTED` 显存逐帧哈希与句柄探测 | **0% 明文** (`16384+` 密文, `CreateSharedHandle=0x80070057`) | 硬件 TMZ 显存呈逐帧加密乱码 |
+
+### Group G：v4.2.0 主动防御实时哨兵与对抗实测 (Tests A–F)
+
+| 用例 | 模拟攻击 / 基线测试 | 实测输出与阻断结果 |
+| :--- | :--- | :--- |
+| `Test A` | 普通权限 (`Medium-IL 0x2000`) 向受保护进程调用 `OpenProcess(VM_WRITE \| VM_OPERATION \| CREATE_THREAD)` 与 `VM_READ` | **PASS**（对照组无锁成功 `err=0`，受锁目标被内核拒绝 **`err=5 ERROR_ACCESS_DENIED`**） |
+| `Test B` | 跨进程写入 `dxgi.dll!CreateDXGIFactory1` 16 字节序言触发 CoW Inline Hook | **PASS**（实时捕获 `[INLINE_HOOK] dxgi.dll!CreateDXGIFactory1 CoW=1` 并弹窗） |
+| `Test C` | 目标进程循环将自身窗口 `WDA` 强清为 `0` 并挂钩 `win32u!NtUserSetWindowDisplayAffinity` | **PASS**（触发 `[WDA_TAMPER]`、`[WDA_STUB_HIJACK]` 与 `[INLINE_HOOK] win32u.dll!NtUserSetWindowDisplayAffinity CoW=1`） |
+| `Test D` | 将未签名外部 DLL 加载进受监控目标进程 | **PASS**（`WinVerifyTrust` 拦截并上报告警 `[UNSIGNED_DLL] trust=0x800B0100`） |
+| `Test E` | 第三方篡改目标进程共享 DXGI `SwapChain::Present` 虚表槽位 (`GhostSwap v2.2`) | **PASS**（检测到 `VTableTamper` 并上报 `[VTABLE_HIJACK]`，**`31ms` 内自动自愈还原原指针**） |
+| `Test F` | 日常真实桌面窗口（Chrome / Edge / Win11 Search / 正常签名应用）无攻击基线 | **PASS**（`0` 误报告警，`SearchHost.exe` 与沙箱内进程自动豁免） |
+
 ---
 
 ## 安全边界与坦诚说明 (Threat Model)
 
-1. **传统 GDI 重定向表面 (`DwmGetDxSharedSurface` / `V19`)**：
-   Modern Chromium / Electron / DirectComposition 渲染窗口的 `DwmGetDxSharedSurface` 本身返回 `ok=0 (0.00%)`，叠加 v4 零注入 `WDA_EXCLUDEFROMCAPTURE` 后已全面封堵 `V11/V18/V19`；但若目标是一个老旧的纯传统 GDI 绘制窗口（非 DirectComposition），Windows 在赋予 `WDA_MONITOR`/`WDA_EXCLUDEFROMCAPTURE` 后，未公开接口 `DwmGetDxSharedSurface` 仍可能访问其旧式 GDI 重定向表面。
-2. **高风险扫盘客户端的磁盘隔离**：
-   单窗隐身层负责防像素抓取，**防扫盘与彻底隔离高风险桌面客户端**仍建议按 [`configs/Sandboxie-Hardening-Template.ini`](configs/Sandboxie-Hardening-Template.ini) 配合 Sandboxie-Plus 使用，在 Ring-0 拦截敏感目录遍历与系统捕获 DLL 加载。
+1. **传统 GDI / Blt-Model (`DISCARD`) 重定向表面 (`DwmGetDxSharedSurface` / `V19` / `EXP-2A`)**：
+   实证确认 Modern Chromium / Electron / `FLIP_DISCARD` Flip-Model / DirectComposition 渲染窗口的 `DwmGetDxSharedSurface` 返回 `0.00%`（`0xC026200B` 或纯黑）；但若目标是一个老旧的纯传统 GDI 或 `DXGI_SWAP_EFFECT_DISCARD` 窗口，即便挂上 `WDA_MONITOR`/`WDA_EXCLUDEFROMCAPTURE`，`DwmGetDxSharedSurface` 仍可在内核暴露其旧式重定向表面。
+2. **高风险扫盘客户端与沙箱兼容性**：
+   单窗隐身与 Target DACL 负责防像素抓取与防跨进程注入，**防扫盘与彻底隔离高风险桌面客户端**仍建议按 [`configs/Sandboxie-Hardening-Template.ini`](configs/Sandboxie-Hardening-Template.ini) 配合 Sandboxie-Plus 使用；同时 v4.2.0 已内置按 `SbieDll.dll` 模块与 `SearchHost.exe` 等 Win11 外壳子树主动豁免，避免误挂沙箱 GPU 子进程或系统搜索界面。
 3. **同桌面窗口几何矩形元数据 (`GetWindowRect`)**：
    在共享交互桌面 (`WinSta0\Default`) 下，即便像素与标题全被阻断，Win32 链表遍历 / UIA 仍可读取窗口的外框坐标和宽高。若需隐藏窗口矩形尺寸，需使用独立 Win32 Desktop 或虚拟机。
 4. **目标保护豁免策略**：
-   为保障系统稳定性与反作弊兼容性，v4.1 零注入单窗隐身引擎默认**跳过** WOW64 32 位进程、OS 核心桌面壳（`Progman`/`WorkerW`/`Shell_TrayWnd` 等）、`Sandbox:` 沙箱窗口、保护/系统进程、GhostSwap 自身遮罩以及主流游戏/反作弊进程，且仅对当前 `affinity == 0` 的宿主原生 x64 顶层窗口生效（不覆盖软件自带的 DRM 标志）。
+   为保障系统稳定性与反作弊兼容性，v4.2 零注入单窗隐身、Target DACL 与 `GhostSwap` 默认**跳过** WOW64 32 位进程、OS 核心桌面壳（`Progman`/`WorkerW`/`Shell_TrayWnd` 及 `SearchHost.exe` 等 WebView2 子树）、IDE/终端/编译器、Sandboxie（含 `Sandbox:` 类及 loaded `SbieDll.dll` 进程）、保护/系统进程以及主流游戏/反作弊进程，且单窗隐身仅对当前 `affinity == 0` 的宿主原生 x64 顶层窗口生效（不覆盖软件自带的 DRM 标志）。
 5. **物理键盘特权截图 (`Ctrl + Alt + Q`) 的两个残余攻击面与对抗实证**：
    - **Windows 全局剪贴板无隔离泄密**：用户敲下回车将截图写入系统剪贴板（`CF_DIB`）的一刻，同桌面任意 Medium-IL 后台进程可通过 `AddClipboardFormatListener` / `GetClipboardData` 实时读走；
    - **~25ms 摘幕竞态空窗**：虽无法被远程或 `SendInput` 触发，但若后台潜伏 60–144fps 死循环录屏木马，存在在用户亲手触发 `Ctrl + Alt + Q` 的数十毫秒摘幕瞬间蹭拍到 1–2 帧的概率（极高敏感场景可通过 `GhostSwap.exe --lock-vram` 焊死 `0x20` 彻底杜绝）；
-   - **物理防手机偷拍的光学极限**：室内手机自动拍照快门（约 `1/30s` + 多帧 HDR）积分慢于人眼暂留，任何不闪瞎人眼的软件 144Hz 频闪均会被手机自动平均还原；因此 `GhostSwap v2.1` 弃用高频频闪，采用 **0% 频闪、0% 空闲占用的瞬间全黑/极暗黑幕 (`Ctrl+Alt+F9/F10/F11`)**。
+   - **物理防手机偷拍的光学极限**：室内手机自动拍照快门（约 `1/30s` + 多帧 HDR）积分慢于人眼暂留，任何不闪瞎人眼的软件 144Hz 频闪均会被手机自动平均还原；因此 `GhostSwap v2.2` 弃用高频频闪，采用 **0% 频闪、0% 空闲占用的瞬间全黑/极暗黑幕 (`Ctrl+Alt+F9/F10/F11`)**。
 
 ---
 
@@ -120,14 +149,14 @@ AegisBlackout 是一个面向 Windows 11 的零内核驱动隐私防窥、防截
 ## 快速上手 (Quick Start)
 
 ### 方式 A：直接下载预编译 Release（推荐）
-1. 前往 [**GitHub Releases**](../../releases/latest) 下载 `AegisBlackout-v4.1.0-win64.zip` 并解压到独立目录（例如 `C:\Program Files\AegisBlackout\`，建议目录本身仅限管理员写入）。
+1. 前往 [**GitHub Releases**](../../releases/latest) 下载 `AegisBlackout-v4.2.0-win64.zip` 并解压到独立目录（例如 `C:\Program Files\AegisBlackout\`，建议目录本身仅限管理员写入）。
 2. 验证校验和（可选）：核对 `SHA256SUMS.txt`。
 3. 右键管理员运行（或直接双击触发 UAC 提权）**`scripts\install_service.bat`**：
    - 自动锁定 `AegisBlackout.exe` / `AegisBlackoutSvc.exe` 为 NTFS 只读权限；
    - 注册并加固 `AegisBlackoutGuard`（LocalSystem 开机自启 + 断线 1 秒拉起 + DACL 防普通进程停服）；
-   - 拉起 **High-IL UIPI + 24×7 GPU HW-DRM + 全局无白名单单窗隐身** 护盾并回显 `aegis_init.log`。
-4. **（可选伴侣部署）** 运行 **`scripts\install_ghostswap.bat`** 部署静默无框的 `GhostSwap v2.1` 开机自启（默认协同护盾模式，提供 `Ctrl+Alt+F9/F10/F11` 防偷拍黑幕；可用 **`scripts\manage_ghostswap.bat`** 一键查看状态或切换 `--lock-vram` 极端焊死模式）。
-5. 查看运行状态运行 `scripts\check_status.bat`；如需完整卸载运行 `scripts\uninstall_service.bat`。
+   - 拉起 **High-IL UIPI + 24×7 GPU HW-DRM + 全局无白名单单窗隐身 + Target DACL & 实时哨兵** 护盾并回显 `aegis_init.log`。
+4. **（可选伴侣部署）** 运行 **`scripts\install_ghostswap.bat`** 部署静默无框的 `GhostSwap v2.2` 开机自启（默认协同护盾模式，提供 `Ctrl+Alt+F9/F10/F11` 防偷拍黑幕与 VTable 哨兵；可用 **`scripts\manage_ghostswap.bat`** 查看实时状态、`aegis_security_alerts.log` 安全告警或切换 `--lock-vram` 极端焊死模式）。
+5. 查看运行状态与哨兵告警运行 `scripts\check_status.bat`；如需完整卸载运行 `scripts\uninstall_service.bat`。
 
 ### 方式 B：从源码本地编译
 环境要求：**Windows 10/11 x64 SDK + MSVC Build Tools（VS 2019 / 2022 / 18+）**
@@ -137,10 +166,10 @@ cd AegisBlackout
 build.bat
 ```
 编译产物将自动输出至 `build\`：
-- `build\AegisBlackout.exe` —— 核心护盾主程序（24×7 HW-DRM + Dual-Lock + 全局无白名单 Special-APC 单窗隐身 + 物理级防静默截图）
+- `build\AegisBlackout.exe` —— 核心护盾主程序（24×7 HW-DRM + Dual-Lock + Special-APC 单窗隐身 + Target DACL + CoW/InlineHook/WDA/UnsignedDLL 哨兵 + 物理级防静默截图）
 - `build\AegisBlackoutSvc.exe` —— Session 0 `SYSTEM` 级防死守护服务
 - `build\CaptureAuditSuite.exe` —— 29 项全向量截屏、红队自卫与 GPU DRM 硬件实证审计工具
-- `build\GhostSwap.exe` —— `GhostSwap v2.1` Fileless `.gpic` DXGI 升维引擎 & 0% 频闪防偷拍黑幕后台
+- `build\GhostSwap.exe` —— `GhostSwap v2.2` Fileless `.gpic` DXGI 升维引擎、VTable 哨兵 & 0% 频闪防偷拍黑幕后台
 - `build\AegisVault.exe` —— 基于 `0x420` HW-DRM 交换链的安全防窥看图隔离舱
 
 ---

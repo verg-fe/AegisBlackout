@@ -1,8 +1,9 @@
 /*
- * GhostSwap.cpp (v2.1)
+ * GhostSwap.cpp (v2.2)
  * - Silent Background Engine (/SUBSYSTEM:WINDOWS, zero console box)
- * - Default Cooperative Shield Mode (lets AegisBlackout v4.1 handle global WDA=0x11 so Ctrl+Alt+Q captures cleanly)
+ * - Default Cooperative Shield Mode (lets AegisBlackout v4.2 handle global WDA=0x11 so Ctrl+Alt+Q captures cleanly)
  * - Optional Extreme Mode (--lock-vram): Global No-Whitelist DXGI SwapChain Upgrader (0x20 DISPLAY_ONLY zero-snow; optional --hw-protected 0x420)
+ * - Real-Time DXGI VTable Ownership Sentinel & Auto-Heal + Alert IPC to AegisBlackout v4.2
  * - 0%-Flicker 0%-Idle-GPU Instant Privacy Blackout / Dimmer Veil (Ctrl+Alt+F9/F10/F11)
  *
  * Build:
@@ -28,6 +29,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <share.h>
 #include <vector>
 #include <string>
 #include <map>
@@ -189,13 +191,19 @@ static bool EnableDebugPrivilege(DWORD* outErr = nullptr)
     return (err == ERROR_SUCCESS);
 }
 
-static void GetStatusFilePath(wchar_t* outBuf, size_t cch)
+static void GetExeRelativePathW(const wchar_t* fileName, wchar_t* outBuf, size_t cch)
 {
+    if (!fileName || !outBuf || cch == 0) return;
     WCHAR exePath[MAX_PATH] = L"";
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     WCHAR* slash = wcsrchr(exePath, L'\\');
     if (slash) *(slash + 1) = L'\0';
-    _snwprintf_s(outBuf, cch, _TRUNCATE, L"%lsghostswap_status.txt", exePath);
+    _snwprintf_s(outBuf, cch, _TRUNCATE, L"%ls%ls", exePath, fileName);
+}
+
+static void GetStatusFilePath(wchar_t* outBuf, size_t cch)
+{
+    GetExeRelativePathW(L"ghostswap_status.txt", outBuf, cch);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -443,15 +451,16 @@ static bool IsSafetyExcludedExe(const wchar_t* exeName)
         static const wchar_t* const kShellExcl[] = {
             L"explorer.exe", L"StartMenuExperienceHost.exe", L"ShellExperienceHost.exe",
             L"ShellHost.exe", L"SearchHost.exe", L"TextInputHost.exe",
-            L"LockApp.exe", L"ShellAppRuntime.exe"
+            L"LockApp.exe", L"ShellAppRuntime.exe", L"Widgets.exe", L"WidgetService.exe"
         };
         for (const wchar_t* s : kShellExcl) if (_wcsicmp(exeName, s) == 0) return true;
     }
 
     static const wchar_t* const kSelfTools[] = {
-        L"GhostSwap.exe", L"GhostSwap_v2.exe", L"ApexShield.exe", L"ApexShield_v4.exe",
-        L"ApexShieldSvc.exe", L"VramVault.exe", L"AegisBlackout.exe", L"AegisBlackoutSvc.exe",
-        L"AegisVault.exe", L"CaptureAuditSuite.exe", L"SbieSvc.exe", L"SbieCtrl.exe", L"SandMan.exe"
+        L"GhostSwap.exe", L"GhostSwap_v2.exe",
+        L"AegisBlackout.exe", L"AegisBlackoutSvc.exe",
+        L"AegisVault.exe", L"CaptureAuditSuite.exe",
+        L"SbieSvc.exe", L"SbieCtrl.exe", L"SandMan.exe"
     };
     for (const wchar_t* s : kSelfTools) if (_wcsicmp(exeName, s) == 0) return true;
     if (_wcsnicmp(exeName, L"Sandboxie", 9) == 0) return true;
@@ -478,6 +487,54 @@ struct ProcInspectResult {
     std::string reason;
 };
 
+static bool HasExcludedShellHostAncestor(DWORD pid)
+{
+    if (pid <= 4) return false;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+
+    struct PNode { DWORD pid, ppid; wchar_t exe[64]; };
+    std::vector<PNode> nodes;
+    nodes.reserve(256);
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            PNode n = { pe.th32ProcessID, pe.th32ParentProcessID, L"" };
+            wcsncpy_s(n.exe, pe.szExeFile, _TRUNCATE);
+            nodes.push_back(n);
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+
+    static const wchar_t* const kShellHostRoots[] = {
+        L"SearchHost.exe", L"StartMenuExperienceHost.exe", L"ShellExperienceHost.exe",
+        L"ShellHost.exe", L"Widgets.exe", L"WidgetService.exe",
+        L"LockApp.exe", L"TextInputHost.exe"
+    };
+
+    DWORD curPid = pid;
+    for (int hop = 0; hop < 5 && curPid > 4; hop++) {
+        DWORD nextPpid = 0;
+        const wchar_t* curExe = nullptr;
+        for (const auto& n : nodes) {
+            if (n.pid == curPid) {
+                nextPpid = n.ppid;
+                curExe = n.exe;
+                break;
+            }
+        }
+        if (!curExe) break;
+        if (hop > 0) {
+            for (const wchar_t* sh : kShellHostRoots) {
+                if (_wcsicmp(curExe, sh) == 0) return true;
+            }
+        }
+        if (nextPpid <= 4 || nextPpid == curPid) break;
+        curPid = nextPpid;
+    }
+    return false;
+}
+
 static ProcInspectResult InspectProcessEligibility(DWORD pid, const wchar_t* exeName, bool enforceBlacklist)
 {
     ProcInspectResult r;
@@ -486,6 +543,7 @@ static ProcInspectResult InspectProcessEligibility(DWORD pid, const wchar_t* exe
 
     if (pid <= 4 || pid == GetCurrentProcessId()) { r.reason = "self/system"; return r; }
     if (enforceBlacklist && IsSafetyExcludedExe(r.exeName.c_str())) { r.reason = "safety-blacklist"; return r; }
+    if (enforceBlacklist && !g_includeShell && HasExcludedShellHostAncestor(pid)) { r.reason = "safety-blacklist"; return r; }
 
     HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     if (!hProc) {
@@ -517,24 +575,30 @@ static ProcInspectResult InspectProcessEligibility(DWORD pid, const wchar_t* exe
     PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfgp = {};
     if (GetProcessMitigationPolicy(hProc, ProcessControlFlowGuardPolicy, &cfgp, sizeof(cfgp))) r.cfg = cfgp.Flags;
 
+    bool hasSbieDll = false;
     HMODULE hMods[1024];
     DWORD cbNeeded = 0;
     if (EnumProcessModulesEx(hProc, hMods, sizeof(hMods), &cbNeeded, LIST_MODULES_64BIT)) {
         DWORD cnt = std::min<DWORD>(cbNeeded / sizeof(HMODULE), 1024);
         for (DWORD i = 0; i < cnt; i++) {
             WCHAR modName[MAX_PATH] = L"";
-            if (GetModuleBaseNameW(hProc, hMods[i], modName, MAX_PATH) && _wcsicmp(modName, L"dxgi.dll") == 0) {
+            if (!GetModuleBaseNameW(hProc, hMods[i], modName, MAX_PATH)) continue;
+            if (enforceBlacklist && _wcsicmp(modName, L"SbieDll.dll") == 0) {
+                hasSbieDll = true;
+                break;
+            }
+            if (_wcsicmp(modName, L"dxgi.dll") == 0) {
                 MODULEINFO mi = {};
                 if (GetModuleInformation(hProc, hMods[i], &mi, sizeof(mi))) {
                     r.dxgiBase = (ULONG_PTR)mi.lpBaseOfDll;
                     r.dxgiSize = mi.SizeOfImage;
                 }
-                break;
             }
         }
     }
     CloseHandle(hProc);
 
+    if (hasSbieDll) { r.reason = "sandboxie-boxed"; return r; }
     if (r.dxgiBase == 0) { r.reason = "no-dxgi"; return r; }
     r.eligible = true;
     r.reason = "eligible";
@@ -554,9 +618,59 @@ struct AttachedTarget {
     DWORD        cfg = 0;
     bool         cfgRegistered = false;
     bool         detached = false;
+    LONG         lastReportedPicTamper = 0;
+    LONG         sharedTamperHealCount = 0;
+    ULONGLONG    lastSlotTamperAlertTick = 0;
     GhostStubData lastTele = {};
     std::vector<PatchedSlotRecord> patchedSlots;
 };
+
+static void EmitGhostAlert(
+    const char* alertType,
+    DWORD pid,
+    const wchar_t* exeName,
+    const char* detail,
+    const char* dedupKey)
+{
+    char exeUtf8[128] = "unknown";
+    if (exeName && exeName[0]) {
+        WideCharToMultiByte(CP_UTF8, 0, exeName, -1, exeUtf8, sizeof(exeUtf8) - 1, NULL, NULL);
+    }
+
+    HANDLE hEv = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\AegisBlackout_SecurityAlert_Ev");
+    if (hEv) {
+        WCHAR lastAlertPath[MAX_PATH] = L"";
+        GetExeRelativePathW(L"aegis_last_alert.txt", lastAlertPath, MAX_PATH);
+        FILE* lf = _wfsopen(lastAlertPath, L"wb", _SH_DENYNO);
+        if (lf) {
+            fprintf(lf, "%s|%lu|%s|%s|%s\n",
+                alertType ? alertType : "VTABLE_HIJACK",
+                pid, exeUtf8,
+                detail ? detail : "",
+                dedupKey ? dedupKey : "");
+            fflush(lf);
+            fclose(lf);
+        }
+        SetEvent(hEv);
+        CloseHandle(hEv);
+    } else {
+        WCHAR alertLogPath[MAX_PATH] = L"";
+        GetExeRelativePathW(L"aegis_security_alerts.log", alertLogPath, MAX_PATH);
+        SYSTEMTIME lt = {};
+        GetLocalTime(&lt);
+        FILE* f = _wfsopen(alertLogPath, L"ab", _SH_DENYNO);
+        if (f) {
+            fprintf(f, "[%04u-%02u-%02u %02u:%02u:%02u] [%s] PID=%lu EXE=%s %s\n",
+                lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond,
+                alertType ? alertType : "VTABLE_HIJACK",
+                pid, exeUtf8, detail ? detail : "");
+            fflush(f);
+            fclose(f);
+        }
+    }
+
+    Logf("[VTABLE-TAMPER] PID=%lu (%s) %s\n", pid, exeUtf8, detail ? detail : "");
+}
 
 static std::vector<AttachedTarget> g_attached;
 static std::map<DWORD, int> g_retryMap;
@@ -622,6 +736,13 @@ static bool AttachToTarget(const ProcInspectResult& info)
     data.origPresent1 = (void*)remoteOrigPtrs[GHOOK_PRESENT1];
     data.iidD3D11Texture2D = __uuidof(ID3D11Texture2D);
     data.iidDXGISwapChain1 = __uuidof(IDXGISwapChain1);
+    data.dxgiBase = (uint64_t)info.dxgiBase;
+    data.dxgiEnd  = (uint64_t)(info.dxgiBase + info.dxgiSize);
+    data.gpicBase = (uint64_t)(ULONG_PTR)pCode;
+    data.gpicEnd  = (uint64_t)((ULONG_PTR)pCode + g_engine.gpicAllocSize);
+    data.vtableTamperCount = 0;
+    data.lastTamperSlot = 0;
+    data.lastTamperAddr = 0;
 
     SIZE_T wr = 0;
     if (!WriteProcessMemory(hProc, pData, &data, sizeof(data), &wr) || wr != sizeof(data)) {
@@ -737,6 +858,7 @@ static void DetachAllTargets()
 
 static void PollAllTelemetry()
 {
+    ULONGLONG now = GetTickCount64();
     for (auto& t : g_attached) {
         if (t.detached || !t.hProc) continue;
         DWORD ec = 0;
@@ -747,7 +869,46 @@ static void PollAllTelemetry()
             continue;
         }
         SIZE_T rd = 0;
-        ReadProcessMemory(t.hProc, (LPCVOID)t.remoteData, &t.lastTele, sizeof(GhostStubData), &rd);
+        if (!ReadProcessMemory(t.hProc, (LPCVOID)t.remoteData, &t.lastTele, sizeof(GhostStubData), &rd) ||
+            rd != sizeof(GhostStubData)) {
+            continue;
+        }
+
+        if (t.lastTele.enabled) {
+            /* Check 1: Shared DXGI VTable overwrite + auto-heal */
+            for (const auto& ps : t.patchedSlots) {
+                ULONG_PTR curVal = 0; SIZE_T srd = 0;
+                if (ReadProcessMemory(t.hProc, (LPCVOID)ps.slotAddr, &curVal, sizeof(curVal), &srd) &&
+                    srd == sizeof(curVal) && curVal != ps.newVal) {
+                    t.sharedTamperHealCount++;
+                    if (t.lastSlotTamperAlertTick == 0 || (now - t.lastSlotTamperAlertTick) >= 5000ULL) {
+                        t.lastSlotTamperAlertTick = now;
+                        char detail[192], dedup[192];
+                        sprintf_s(detail, sizeof(detail), "shared slotAddr=0x%llX overwritten to 0x%llX (auto-healed)",
+                            (unsigned long long)ps.slotAddr, (unsigned long long)curVal);
+                        sprintf_s(dedup, sizeof(dedup), "VTSLOT_%lu_%llX", t.pid, (unsigned long long)ps.slotAddr);
+                        EmitGhostAlert("VTABLE_HIJACK", t.pid, t.exeName.c_str(), detail, dedup);
+                    }
+                    DWORD oldP = 0; SIZE_T swr = 0;
+                    if (VirtualProtectEx(t.hProc, (LPVOID)ps.slotAddr, sizeof(ULONG_PTR), PAGE_READWRITE, &oldP)) {
+                        WriteProcessMemory(t.hProc, (LPVOID)ps.slotAddr, &ps.newVal, sizeof(ps.newVal), &swr);
+                        DWORD dummy = 0;
+                        VirtualProtectEx(t.hProc, (LPVOID)ps.slotAddr, sizeof(ULONG_PTR), oldP, &dummy);
+                    }
+                }
+            }
+
+            /* Check 2: Per-object VTable swap detected inside .gpic Present/Present1 */
+            if (t.lastTele.vtableTamperCount > t.lastReportedPicTamper) {
+                t.lastReportedPicTamper = t.lastTele.vtableTamperCount;
+                char detail[192], dedup[192];
+                sprintf_s(detail, sizeof(detail), "per-object slot=%u addr=0x%llX out-of-range (count=%ld)",
+                    t.lastTele.lastTamperSlot, (unsigned long long)t.lastTele.lastTamperAddr,
+                    t.lastTele.vtableTamperCount);
+                sprintf_s(dedup, sizeof(dedup), "VTOBJ_%lu_%u", t.pid, t.lastTele.lastTamperSlot);
+                EmitGhostAlert("VTABLE_HIJACK", t.pid, t.exeName.c_str(), detail, dedup);
+            }
+        }
     }
 }
 
@@ -1086,7 +1247,7 @@ static DWORD WINAPI VeilThreadProc(LPVOID)
 static int RunSelfTest()
 {
     Logf("========================================================================\n");
-    Logf("GhostSwap v2.1 Self-Test: 0x20 Zero-Snow PIC Engine + Solid Blackout Veil\n");
+    Logf("GhostSwap v2.2 Self-Test: 0x20 Zero-Snow PIC Engine + Solid Blackout Veil\n");
     Logf("========================================================================\n");
 
     WCHAR desk[128] = L"?"; DWORD need = 0;
@@ -1190,7 +1351,7 @@ static int RunSelfTest()
 static int RunDryRun()
 {
     Logf("========================================================================\n");
-    Logf("GhostSwap v2.1 --dry-run (Global No-Whitelist x64 DXGI Process Audit)\n");
+    Logf("GhostSwap v2.2 --dry-run (Global No-Whitelist x64 DXGI Process Audit)\n");
     Logf("========================================================================\n");
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 1;
@@ -1203,7 +1364,7 @@ static int RunDryRun()
                 elig++;
                 Logf("  [TARGET]   PID=%-6lu %-26ls dxgi=0x%llX CIG=0x%lX CFG=0x%lX\n",
                     r.pid, r.exeName.c_str(), (unsigned long long)r.dxgiBase, r.cig, r.cfg);
-            } else if (r.reason == "safety-blacklist") {
+            } else if (r.reason == "safety-blacklist" || r.reason == "sandboxie-boxed") {
                 sysExcl++;
                 Logf("  [EXCLUDED] PID=%-6lu %-26ls reason=%s\n", r.pid, r.exeName.c_str(), r.reason.c_str());
             } else if (r.reason == "acg-enabled" || r.reason == "protected-ppl") {
@@ -1225,8 +1386,7 @@ static bool IsShieldRunning(DWORD* outPid = nullptr)
     PROCESSENTRY32W pe = { sizeof(pe) };
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, L"AegisBlackout.exe") == 0 ||
-                _wcsicmp(pe.szExeFile, L"ApexShield.exe") == 0) {
+            if (_wcsicmp(pe.szExeFile, L"AegisBlackout.exe") == 0) {
                 found = true;
                 if (outPid) *outPid = pe.th32ProcessID;
                 break;
@@ -1239,7 +1399,7 @@ static bool IsShieldRunning(DWORD* outPid = nullptr)
 
 static void WriteStatusFileSnapshot(bool hasDebug)
 {
-    LONG totCreate = 0, totUp = 0, totResUp = 0, totVer020 = 0, totVer80000 = 0;
+    LONG totCreate = 0, totUp = 0, totResUp = 0, totVer020 = 0, totVer80000 = 0, totVtableTamper = 0;
     int activeCnt = 0;
     if (g_lockVramMode) {
         PollAllTelemetry();
@@ -1250,6 +1410,7 @@ static void WriteStatusFileSnapshot(bool hasDebug)
             totResUp += t.lastTele.resizeUpgraded;
             totVer020 += t.lastTele.verifiedDisplayOnly;
             totVer80000 += t.lastTele.verifiedHwProtBackBuf;
+            totVtableTamper += t.lastTele.vtableTamperCount + t.sharedTamperHealCount;
         }
     }
 
@@ -1264,12 +1425,12 @@ static void WriteStatusFileSnapshot(bool hasDebug)
 
     SYSTEMTIME lt = {}; GetLocalTime(&lt);
     fprintf(f, "========================================================================\n");
-    fprintf(f, "  GhostSwap v2.1 后台无感运行状态 (%04u-%02u-%02u %02u:%02u:%02u)\n",
+    fprintf(f, "  GhostSwap v2.2 后台无感运行状态 (%04u-%02u-%02u %02u:%02u:%02u)\n",
         lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond);
     fprintf(f, "========================================================================\n");
     fprintf(f, "  进程 PID         : %lu (%s)\n", GetCurrentProcessId(), hasDebug ? "管理员无感后台" : "当前用户后台");
     if (!g_lockVramMode) {
-        fprintf(f, "  运行模式         : 协同护盾模式 (防截屏由 AegisBlackout v4.1 全局托管，保证 Ctrl+Alt+Q 自己清晰截屏)\n");
+        fprintf(f, "  运行模式         : 协同护盾模式 (防截屏由 AegisBlackout v4.2 全局托管，保证 Ctrl+Alt+Q 自己清晰截屏)\n");
         if (shieldUp) {
             fprintf(f, "  AegisBlackout 护盾 : 运行中 (PID=%lu)\n", shieldPid);
         } else {
@@ -1284,8 +1445,8 @@ static void WriteStatusFileSnapshot(bool hasDebug)
     fprintf(f, "  快捷键           : Ctrl+Alt+F9 开关黑幕 | F10 100%%/85%%切换 | F11 浓度循环 | Ctrl+Alt+Q 自己特权截屏\n");
     if (g_lockVramMode) {
         fprintf(f, "  已挂载活动进程数 : %d (累计挂载 %zu)\n", activeCnt, g_attached.size());
-        fprintf(f, "  累计升级统计     : Create=%ld | Upgraded=%ld | ResizeUp=%ld | Verified0x20=%ld | Verified0x80000=%ld\n",
-            totCreate, totUp, totResUp, totVer020, totVer80000);
+        fprintf(f, "  累计升级统计     : Create=%ld | Upgraded=%ld | ResizeUp=%ld | Verified0x20=%ld | Verified0x80000=%ld | VTableTamper=%ld\n",
+            totCreate, totUp, totResUp, totVer020, totVer80000, totVtableTamper);
         fprintf(f, "------------------------------------------------------------------------\n");
         for (const auto& t : g_attached) {
             if (t.detached) continue;
@@ -1425,11 +1586,12 @@ static void PrintDetailedTargetLogs()
     PollAllTelemetry();
     for (const auto& t : g_attached) {
         const auto& s = t.lastTele;
-        Logf("  -> PID=%lu (%ls) active=%d Create=%ld [Primary=%ld Fallback=%ld Orig=%ld] Verified0x20=%ld VerifiedHwProt=%ld Resize=%ld/%ld Pres=%ld Last[Flags:0x%lX->0x%lX Misc:0x%lX Hr:0x%08lX %ldx%ld]\n",
+        Logf("  -> PID=%lu (%ls) active=%d Create=%ld [Primary=%ld Fallback=%ld Orig=%ld] Verified0x20=%ld VerifiedHwProt=%ld Resize=%ld/%ld Pres=%ld VTableTamper=%ld(heal=%ld) Last[Flags:0x%lX->0x%lX Misc:0x%lX Hr:0x%08lX %ldx%ld]\n",
             t.pid, t.exeName.c_str(), t.detached ? 0 : 1,
             s.totalCreateCalls, s.upgraded420, s.upgraded400, s.fallbackOrig,
             s.verifiedDisplayOnly, s.verifiedHwProtBackBuf,
             s.resizeUpgraded, s.resizeCalls, s.presentCalls,
+            s.vtableTamperCount, t.sharedTamperHealCount,
             s.lastOrigFlags, s.lastFinalFlags, s.lastBackBufMisc, s.lastHr, s.lastW, s.lastH);
     }
 }
@@ -1665,6 +1827,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 
     ULONGLONG startTick = GetTickCount64();
     ULONGLONG lastStatusWrite = 0;
+    ULONGLONG lastVtablePoll = 0;
 
     while (InterlockedCompareExchange(&g_running, 0, 0) != 0) {
         if (g_lockVramMode) {
@@ -1672,6 +1835,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
         }
 
         ULONGLONG now = GetTickCount64();
+        if (g_lockVramMode && !g_attached.empty() && (now - lastVtablePoll >= 500)) {
+            lastVtablePoll = now;
+            PollAllTelemetry();
+        }
         if (now - lastStatusWrite >= 2000) {
             lastStatusWrite = now;
             WriteStatusFileSnapshot(hasDebug);

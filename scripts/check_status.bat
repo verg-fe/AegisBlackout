@@ -8,7 +8,7 @@ if not exist "%BIN_DIR%\aegis_init.log" if exist "%BASE_DIR%\..\build\aegis_init
 )
 
 echo ====================================================================
-echo   AegisBlackout v4.1.0 - Runtime Status Check
+echo   AegisBlackout v4.2.0 - Runtime Status Check
 echo ====================================================================
 echo.
 
@@ -38,6 +38,15 @@ if exist "%BIN_DIR%\aegis_init.log" (
     echo ----------------------------------------
 ) else (
     echo  [INFO] No aegis_init.log found in "%BIN_DIR%".
+)
+
+echo.
+if exist "%BIN_DIR%\aegis_security_alerts.log" (
+    echo --- Real-Time Sentinel Alerts ^(aegis_security_alerts.log^) ---
+    powershell -NoProfile -Command "Get-Content -LiteralPath '%BIN_DIR%\aegis_security_alerts.log' -Tail 20"
+    echo ------------------------------------------------------------
+) else (
+    echo  [OK] Real-Time Sentinel Alerts: 0 alerts recorded.
 )
 
 echo.
