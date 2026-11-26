@@ -28,7 +28,7 @@ if not exist "%BIN_DIR%\AegisBlackoutSvc.exe" (
 )
 
 echo ====================================================================
-echo   AegisBlackout v4.0.2 - Kernel UIPI + Per-Window Cloak + Watchdog Installer
+echo   AegisBlackout v4.1.0 - Kernel UIPI + Global Per-Window Cloak + Watchdog Installer
 echo ====================================================================
 echo   Binary Directory: "%BIN_DIR%"
 echo.

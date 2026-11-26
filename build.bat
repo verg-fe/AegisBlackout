@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 echo ====================================================================
-echo   AegisBlackout v4.0.2 - x64 MSVC Static Build
+echo   AegisBlackout v4.1.0 - x64 MSVC Static Build
 echo ====================================================================
 
 set "VCVARS="
@@ -46,15 +46,15 @@ if %errorlevel% neq 0 (
 if not exist "build" mkdir "build"
 
 echo.
-echo [1/3] Compiling build\AegisBlackout.exe ...
-cl /nologo /EHsc /O2 /MT /W3 /DUNICODE /D_UNICODE ^
+echo [1/5] Compiling build\AegisBlackout.exe ...
+cl /nologo /utf-8 /EHsc /O2 /MT /W3 /DUNICODE /D_UNICODE ^
     "src\AegisBlackout.cpp" ^
     /Fe:"build\AegisBlackout.exe" /Fo:"build\AegisBlackout.obj" ^
     /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib dwmapi.lib d3d11.lib dxgi.lib dcomp.lib advapi32.lib bcrypt.lib shell32.lib
 if %errorlevel% neq 0 exit /b 1
 
 echo.
-echo [2/3] Compiling build\AegisBlackoutSvc.exe ...
+echo [2/5] Compiling build\AegisBlackoutSvc.exe ...
 cl /nologo /O2 /MT /W3 /DUNICODE /D_UNICODE ^
     "src\AegisBlackoutSvc.c" ^
     /Fe:"build\AegisBlackoutSvc.exe" /Fo:"build\AegisBlackoutSvc.obj" ^
@@ -62,11 +62,28 @@ cl /nologo /O2 /MT /W3 /DUNICODE /D_UNICODE ^
 if %errorlevel% neq 0 exit /b 1
 
 echo.
-echo [3/3] Compiling build\CaptureAuditSuite.exe ...
+echo [3/5] Compiling build\CaptureAuditSuite.exe ...
 cl /nologo /EHsc /std:c++17 /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS /O2 /MT /W3 ^
     "src\CaptureAuditSuite.cpp" ^
     /Fe:"build\CaptureAuditSuite.exe" /Fo:"build\CaptureAuditSuite.obj" ^
     /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib dwmapi.lib d3d11.lib dxgi.lib d3d9.lib windowsapp.lib advapi32.lib ole32.lib
+if %errorlevel% neq 0 exit /b 1
+
+echo.
+echo [4/5] Compiling build\AegisVault.exe ...
+cl /nologo /utf-8 /EHsc /O2 /MT /W3 /DUNICODE /D_UNICODE ^
+    "src\AegisVault.cpp" ^
+    /Fe:"build\AegisVault.exe" /Fo:"build\AegisVault.obj" ^
+    /link /SUBSYSTEM:WINDOWS d3d11.lib dxgi.lib d3dcompiler.lib d3d12.lib user32.lib gdi32.lib comdlg32.lib shell32.lib ole32.lib windowscodecs.lib advapi32.lib
+if %errorlevel% neq 0 exit /b 1
+
+echo.
+echo [5/5] Compiling build\GhostSwap.exe (Fileless PIC .gpic + Anti-Camera Veil)...
+cl /nologo /c /O2 /GS- /GL- /EHs-c- /GR- /Oi- /guard:cf- /Fo:"build\ghost_pic.obj" "src\ghost_pic.cpp"
+if %errorlevel% neq 0 exit /b 1
+cl /nologo /utf-8 /O2 /W3 /EHsc /MT "src\GhostSwap.cpp" "build\ghost_pic.obj" ^
+    /Fe:"build\GhostSwap.exe" /Fo:"build\GhostSwap.obj" ^
+    /link /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup /INCREMENTAL:NO user32.lib gdi32.lib d3d11.lib dxgi.lib dcomp.lib advapi32.lib psapi.lib shell32.lib
 if %errorlevel% neq 0 exit /b 1
 
 del /f /q "build\*.obj" >nul 2>&1
@@ -77,5 +94,7 @@ echo   [OK] Build complete:
 echo        build\AegisBlackout.exe
 echo        build\AegisBlackoutSvc.exe
 echo        build\CaptureAuditSuite.exe
+echo        build\AegisVault.exe
+echo        build\GhostSwap.exe
 echo ====================================================================
 exit /b 0

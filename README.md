@@ -1,22 +1,26 @@
-# AegisBlackout (黑幕神盾) v4.0.2
+# AegisBlackout (黑幕神盾) v4.1.0
 
-**Windows 11 24×7 GPU 硬件 DRM (`HW_PROTECTED | DISPLAY_ONLY`) + 零注入 Special-APC 单窗隐身 (`WDA_EXCLUDEFROMCAPTURE`) + `WDA_MONITOR` + Ring-0 UIPI (`High-IL`) + `SYSTEM` 自愈守护反截屏与反录屏护盾**
+**Windows 11 24×7 GPU 硬件 DRM (`HW_PROTECTED | DISPLAY_ONLY`) + 全局无白名单 Special-APC 单窗隐身 (`WDA_EXCLUDEFROMCAPTURE`) + `GhostSwap v2.1` Fileless PIC / 0%频闪防拍黑幕 + `AegisVault` 隔离浏览 + Ring-0 UIPI (`High-IL`) & `SYSTEM` 自愈守护**
 
-> **Zero Custom `.sys` Driver | Zero DLL Injection | VBS / HVCI & ACG / CFG Compatible | Zero Hotkey Occupation (`RegisterHotKey = 0`) | Zero-Silent Physical Hardware Snipping**
+> **Zero Custom `.sys` Driver | VBS / HVCI & ACG / CFG Compatible | Global No-Whitelist Zero-Snow | Zero Hotkey Interference (`Ctrl+Alt+Q` Physical HID) | Cooperative Shield Mode**
 
-AegisBlackout 是一个面向 Windows 11 的零内核驱动、零 DLL 注入隐私防窥与防录屏框架。**v4.0.2 在 24×7 GPU 硬件受保护显示叠加层、全屏 DWM 遮罩与 `High-IL` UIPI 隔离的基础上，进一步强化了基于 `NtQueueApcThreadEx2` (`QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC`) + 原生 `win32u!NtUserSetWindowDisplayAffinity` 的“零注入单窗隐身引擎”**：在排程前使用 `CreateToolhelp32Snapshot(TH32CS_SNAPMODULE)` 严格校验 `win32u.dll` 基址并排除 `ConsoleWindowClass` 控制台宿主；采用 **最小边 `>=16px` 且面积 `>=1024px²`** 面积门限全面封堵单边细长条与迷你窗豁免；通过非阻塞 `EVENT_OBJECT_LOCATIONCHANGE` 监听与无全局防抖单窗快路径将放大 TOCTOU 与高频弹窗竞态压制至 `~15ms` 级，配合 `200ms` 巡检及服务重启自动认领机制，在**不依赖沙箱的纯宿主机环境下**将定向单窗抓拍（`PrintWindow(PW_RENDERFULLCONTENT)` 与 `WGC CreateForWindow`）像素泄漏压制至 `0.00%`（仅 DWM 非客户区 1px 阴影边框 `~0.4%`，正文 0 像素）。
+AegisBlackout 是一个面向 Windows 11 的零内核驱动隐私防窥、防截屏与防录屏框架。**v4.1.0 在 v4.0 零注入 `NtQueueApcThreadEx2` (`QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC`) + `win32u!NtUserSetWindowDisplayAffinity` 的基础上完成三项核心进化**：
+1. **全局无白名单零雪花单窗隐身（`AegisBlackout v4.1.0`）**：移除微信/QQ/终端等宿主限制，引入 `EVENT_OBJECT_CREATE/SHOW/LOCATIONCHANGE` 瞬时唤醒、`50ms` 快巡检与 `3` 次瞬态重试容错，新打开的 Chrome / Edge / Electron / Weixin / QQ 等全部 x64 程序毫秒自动隐身（`V11/V18 -> 0.00%` 且零雪花），并将 `Ctrl+Alt+Q` 截图前摘幕校验加固至 `150ms` 轮询 + 3× `DwmFlush()`，保证**全软件 0.00% 外部泄漏的同时，物理键 `Ctrl+Alt+Q` 仍可完整清晰截图**。
+2. **`GhostSwap v2.1` 无文件 PIC DXGI 升维引擎与一键防偷拍黑幕**：内嵌纯 `.gpic` 位置无关代码（0 重定位、16 字节对齐，并通过 `SetProcessValidCallTargets` 注册 CFG 合法跳转目标），实证定位 AMD RX 9070 下 `0x420` 对 Chrome (`BGRA8 + Usage=0x30 SRV`) 产生雪花屏、而对微信 (`RGBA8`) 无雪花的底层根因，提出通用的零雪花 `0x20 DISPLAY_ONLY` 方案；默认以**协同护盾模式**（0% 进程注入、0 冲突，提供 `Ctrl+Alt+F9/F10/F11` **0% 频闪、0% 空闲占用的 100%/85%/65% 一键防手机偷拍黑幕**）无感驻留后台，也支持 `--lock-vram` 一键切换为连 `Ctrl+Alt+Q` 也截黑的极端显存焊死模式。
+3. **`AegisVault` 独立硬件加密浏览沙箱**：内置基于 D3D11/D3D12 `0x420` 硬件保护表面的离线密保图/文档查看器。
 
 ---
 
 ## English Overview
 
-**AegisBlackout v4.0** is a driverless, injectionless Windows 11 anti-screen-capture and anti-recording shield engineered for strict compatibility with VBS/HVCI, ACG/CIG/CFG, and anti-cheat environments:
+**AegisBlackout v4.1.0** is a driverless Windows 11 anti-screen-capture, anti-recording, and privacy curtain framework designed for VBS/HVCI, ACG/CIG/CFG, and competitive gaming/anti-cheat environments:
 
-- **24×7 GPU Hardware-Protected DRM Overlay**: Creates a fullscreen `DirectComposition` (`IDCompositionDevice`) swap chain with `DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED | DXGI_SWAP_CHAIN_FLAG_DISPLAY_ONLY` (`0x420`) backed by hardware-protected VRAM (`D3D11_RESOURCE_MISC_HW_PROTECTED`), automatically falling back to `WS_EX_LAYERED` if unavailable.
-- **Zero-Injection Special-APC Per-Window Cloak (New in v4.0)**: Uses `NtQueueApcThreadEx2(..., QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC, win32u!NtUserSetWindowDisplayAffinity, hwnd, WDA_EXCLUDEFROMCAPTURE, NULL)` directly on Microsoft-signed `win32u` syscall stubs — zero remote allocations, zero `WriteProcessMemory`, zero `CreateRemoteThread`. Seals bare-metal per-window `PrintWindow(PW_RENDERFULLCONTENT)` and `WGC CreateForWindow`, atomically uncloaks/recloaks during `Ctrl+Alt+Q`, and cleanly restores `WDA_NONE` on exit.
-- **Dual-Lock Click-Through Curtain**: Combines `WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE` (`WM_NCHITTEST -> HTTRANSPARENT`) with `SetWindowDisplayAffinity(WDA_MONITOR)`, an active `100ms` Z-order watchdog, and `SetWinEventHook`.
-- **Ring-0 `win32k.sys` UIPI + `NT AUTHORITY\SYSTEM` Watchdog**: A hardened LocalSystem service (`AegisBlackoutGuard`) acquires the active console user's elevated `TokenLinkedToken` to spawn `AegisBlackout.exe` at **High Integrity Level** in `winsta0\default` with zero UAC prompts at boot, Protected Process DACL, `ProcessExtensionPointDisablePolicy`, `ProcessImageLoadPolicy`, and NTFS read-only ACLs.
-- **Zero-Silent Hardware-Only Raw Input**: Uses passive `RegisterRawInputDevices` (`RIDEV_INPUTSINK`) verifying `hDevice != NULL` and physical HID/ACPI/USB device paths — blocking synthetic `SendInput` / `keybd_event` / RDP spoofing while registering **zero** system hotkeys.
+- **24×7 GPU Hardware-Protected DRM Overlay**: Creates a fullscreen `DirectComposition` (`IDCompositionDevice`) swap chain with `DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED | DXGI_SWAP_CHAIN_FLAG_DISPLAY_ONLY` (`0x420`) backed by hardware-protected VRAM (`D3D11_RESOURCE_MISC_HW_PROTECTED`), gracefully falling back to `WS_EX_LAYERED` when unsupported.
+- **Global No-Whitelist Zero-Injection Special-APC Cloak (Upgraded in v4.1.0)**: Uses `NtQueueApcThreadEx2(..., QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC, win32u!NtUserSetWindowDisplayAffinity, hwnd, WDA_EXCLUDEFROMCAPTURE, NULL)` directly on Microsoft-signed `win32u` syscall stubs — zero remote DLLs, zero remote allocations, zero `WriteProcessMemory`. Expanded globally across Chrome, Edge, Electron, WeChat/Weixin, QQ, terminals, and newly launched apps via `50ms` sweeps, `EVENT_OBJECT_CREATE` + `SHOW` + `LOCATIONCHANGE` hooks, and 3-attempt transient retry tolerance. Hardened `Ctrl+Alt+Q` capture unmasking (`150ms` affinity poll + 3× `DwmFlush()`) preserves clean privileged self-capture while keeping external captures at **0.00%**.
+- **GhostSwap v2.1 (Fileless `.gpic` PIC Engine + 0%-Flicker Privacy Veil)**: Includes a relocation-free, 16-byte-aligned `.gpic` DXGI swap-chain vtable upgrader compatible with ACG/CIG (`NoRemoteImages`, `DynamicCode` policies permitting) and CFG (`SetProcessValidCallTargets`). Resolves AMD RX 9070 `BGRA8` vs `RGBA8` `HW_PROTECTED` snow artifacts using universal zero-snow `0x20 DISPLAY_ONLY`. Runs by default in **Cooperative Shield Mode** alongside `AegisBlackout v4.1.0` providing an event-driven 0%-flicker / 0%-idle-GPU solid blackout/dimmer veil (`Ctrl+Alt+F9/F10/F11`), with `--lock-vram` available for extreme lockout.
+- **AegisVault (`src/AegisVault.cpp`)**: Standalone `HW_PROTECTED` GPU-encrypted media viewer.
+- **Ring-0 `win32k.sys` UIPI + `NT AUTHORITY\SYSTEM` Watchdog**: Hardened LocalSystem service (`AegisBlackoutGuard`) launches `AegisBlackout.exe` at **High Integrity Level** in `winsta0\default` with zero UAC prompts at boot, strict process DACL, `ProcessExtensionPointDisablePolicy`, `ProcessImageLoadPolicy`, and NTFS read-only ACLs.
+- **Zero-Silent Hardware-Only Raw Input**: Passive `RegisterRawInputDevices` (`RIDEV_INPUTSINK`) verifies physical HID/ACPI/USB device handles — blocking synthetic `SendInput` / `keybd_event` / RDP spoofing while registering zero hotkeys in `AegisBlackout.exe`.
 
 ---
 
@@ -77,20 +81,33 @@ AegisBlackout 是一个面向 Windows 11 的零内核驱动、零 DLL 注入隐�
 3. **同桌面窗口几何矩形元数据 (`GetWindowRect`)**：
    在共享交互桌面 (`WinSta0\Default`) 下，即便像素与标题全被阻断，Win32 链表遍历 / UIA 仍可读取窗口的外框坐标和宽高。若需隐藏窗口矩形尺寸，需使用独立 Win32 Desktop 或虚拟机。
 4. **目标保护豁免策略**：
-   为保障系统稳定性与反作弊兼容性，v4 零注入单窗隐身引擎默认**跳过** WOW64 32 位进程、OS 核心桌面壳（`Progman`/`WorkerW`/`Shell_TrayWnd` 等）、`Sandbox:` 沙箱窗口、保护/系统进程以及主流游戏/反作弊进程，且仅对当前 `affinity == 0` 的宿主原生 x64 顶层窗口生效（不覆盖软件自带的 DRM 标志）。
+   为保障系统稳定性与反作弊兼容性，v4.1 零注入单窗隐身引擎默认**跳过** WOW64 32 位进程、OS 核心桌面壳（`Progman`/`WorkerW`/`Shell_TrayWnd` 等）、`Sandbox:` 沙箱窗口、保护/系统进程、GhostSwap 自身遮罩以及主流游戏/反作弊进程，且仅对当前 `affinity == 0` 的宿主原生 x64 顶层窗口生效（不覆盖软件自带的 DRM 标志）。
+5. **物理键盘特权截图 (`Ctrl + Alt + Q`) 的两个残余攻击面与对抗实证**：
+   - **Windows 全局剪贴板无隔离泄密**：用户敲下回车将截图写入系统剪贴板（`CF_DIB`）的一刻，同桌面任意 Medium-IL 后台进程可通过 `AddClipboardFormatListener` / `GetClipboardData` 实时读走；
+   - **~25ms 摘幕竞态空窗**：虽无法被远程或 `SendInput` 触发，但若后台潜伏 60–144fps 死循环录屏木马，存在在用户亲手触发 `Ctrl + Alt + Q` 的数十毫秒摘幕瞬间蹭拍到 1–2 帧的概率（极高敏感场景可通过 `GhostSwap.exe --lock-vram` 焊死 `0x20` 彻底杜绝）；
+   - **物理防手机偷拍的光学极限**：室内手机自动拍照快门（约 `1/30s` + 多帧 HDR）积分慢于人眼暂留，任何不闪瞎人眼的软件 144Hz 频闪均会被手机自动平均还原；因此 `GhostSwap v2.1` 弃用高频频闪，采用 **0% 频闪、0% 空闲占用的瞬间全黑/极暗黑幕 (`Ctrl+Alt+F9/F10/F11`)**。
+
+---
+
+## 下期开发计划 (Roadmap)
+
+- **无驱动「键盘防记录 + 剪贴板防窃取」防护体系**：
+  - 针对 `WH_KEYBOARD_LL` 全局钩子、`GetAsyncKeyState` 轮询、`RegisterRawInputDevices(RIDEV_INPUTSINK)` 后台监听的键盘防记录对抗；
+  - 针对 `AddClipboardFormatListener` / `GetClipboardData` 的剪贴板隐私锁、特权截图安全落地与延时自毁机制。
 
 ---
 
 ## 快速上手 (Quick Start)
 
 ### 方式 A：直接下载预编译 Release（推荐）
-1. 前往 [**GitHub Releases**](../../releases/latest) 下载 `AegisBlackout-v4.0.2-win64.zip` 并解压到独立目录（例如 `C:\Program Files\AegisBlackout\`，建议目录本身仅限管理员写入）。
+1. 前往 [**GitHub Releases**](../../releases/latest) 下载 `AegisBlackout-v4.1.0-win64.zip` 并解压到独立目录（例如 `C:\Program Files\AegisBlackout\`，建议目录本身仅限管理员写入）。
 2. 验证校验和（可选）：核对 `SHA256SUMS.txt`。
-3. 右键管理员运行（或直接双击触发 UAC 提权）**`install_service.bat`**：
+3. 右键管理员运行（或直接双击触发 UAC 提权）**`scripts\install_service.bat`**：
    - 自动锁定 `AegisBlackout.exe` / `AegisBlackoutSvc.exe` 为 NTFS 只读权限；
    - 注册并加固 `AegisBlackoutGuard`（LocalSystem 开机自启 + 断线 1 秒拉起 + DACL 防普通进程停服）；
-   - 拉起 **High-IL UIPI + 24×7 GPU HW-DRM + 零注入单窗隐身** 护盾并回显 `aegis_init.log`。
-4. 查看运行状态运行 `check_status.bat`；如需完整卸载运行 `uninstall_service.bat`。
+   - 拉起 **High-IL UIPI + 24×7 GPU HW-DRM + 全局无白名单单窗隐身** 护盾并回显 `aegis_init.log`。
+4. **（可选伴侣部署）** 运行 **`scripts\install_ghostswap.bat`** 部署静默无框的 `GhostSwap v2.1` 开机自启（默认协同护盾模式，提供 `Ctrl+Alt+F9/F10/F11` 防偷拍黑幕；可用 **`scripts\manage_ghostswap.bat`** 一键查看状态或切换 `--lock-vram` 极端焊死模式）。
+5. 查看运行状态运行 `scripts\check_status.bat`；如需完整卸载运行 `scripts\uninstall_service.bat`。
 
 ### 方式 B：从源码本地编译
 环境要求：**Windows 10/11 x64 SDK + MSVC Build Tools（VS 2019 / 2022 / 18+）**
@@ -100,20 +117,24 @@ cd AegisBlackout
 build.bat
 ```
 编译产物将自动输出至 `build\`：
-- `build\AegisBlackout.exe` —— 核心护盾主程序（24×7 HW-DRM + Dual-Lock + 零注入 Special-APC 单窗隐身 + 物理级防静默截图）
+- `build\AegisBlackout.exe` —— 核心护盾主程序（24×7 HW-DRM + Dual-Lock + 全局无白名单 Special-APC 单窗隐身 + 物理级防静默截图）
 - `build\AegisBlackoutSvc.exe` —— Session 0 `SYSTEM` 级防死守护服务
 - `build\CaptureAuditSuite.exe` —— 29 项全向量截屏、红队自卫与 GPU DRM 硬件实证审计工具
+- `build\GhostSwap.exe` —— `GhostSwap v2.1` Fileless `.gpic` DXGI 升维引擎 & 0% 频闪防偷拍黑幕后台
+- `build\AegisVault.exe` —— 基于 `0x420` HW-DRM 交换链的安全防窥看图隔离舱
 
 ---
 
-## 物理硬件快捷键说明
+## 物理硬件与防拍快捷键说明
 
-> 全部基于 `RegisterRawInputDevices` 硬件原始输入被动观测，**不调用 `RegisterHotKey`**，不会与任何第三方软件或游戏的组合键产生占位冲突。
+> `AegisBlackout.exe` 全部基于 `RegisterRawInputDevices` 硬件原始输入被动观测，**不调用 `RegisterHotKey`**，不会与任何第三方软件或游戏的组合键产生占位冲突。
 
-| 快捷键 | 功能 | 说明 |
-| :--- | :--- | :--- |
-| **`Ctrl + Alt + Q`** | **零静默特权截屏** | 仅响应真实物理键盘；原子临时还原单窗 WDA 并隐藏全屏幕布抓取干净桌面后瞬间恢复全部防护，开启受 `WDA_MONITOR` 保护的 4K 暗化选区画布，满足 `>= 150ms` 可视停留并经物理 **双击** 或 **`Enter`** 确认后才写入剪贴板 `CF_DIB`，关闭瞬间 `SecureZeroMemory` 擦除缓冲 |
-| **`Ctrl + Alt + Shift + End`** | **紧急干净退出（免 UAC）** | 仅响应真实物理键盘；自动还原所有受保护窗口的 `WDA_NONE` 状态，并返回专属退出码 `0x5A5A` 通知 `AegisBlackoutGuard` 服务优雅停止 |
+| 快捷键 | 所属模块 | 功能 | 说明 |
+| :--- | :--- | :--- | :--- |
+| **`Ctrl + Alt + Q`** | `AegisBlackout` | **零静默特权截屏** | 仅响应真实物理键盘；原子临时还原单窗 WDA 并隐藏全屏幕布（`150ms` 校验 + 3× `DwmFlush()`）抓取干净桌面后瞬间恢复全部防护，开启受 `WDA_MONITOR` 保护的 4K 暗化选区画布，经物理双击或 `Enter` 确认写入剪贴板，关闭瞬间 `SecureZeroMemory` 擦除缓冲 |
+| **`Ctrl + Alt + F9`** | `GhostSwap` | **瞬间防偷拍黑幕开关** | 0% 频闪、0% 空闲 GPU 占用的顶层黑幕，开启瞬间防手机直拍 |
+| **`Ctrl + Alt + F10 / F11`** | `GhostSwap` | **黑幕遮罩浓度调节** | `F10` 快速切换 `100% 纯黑防拍` / `85% 极暗防窥`；`F11` 循环 `100% / 85% / 65% 低亮护眼` |
+| **`Ctrl + Alt + Shift + End`** | `AegisBlackout` | **紧急干净退出（免 UAC）** | 仅响应真实物理键盘；自动还原所有受保护窗口的 `WDA_NONE` 状态，并返回专属退出码 `0x5A5A` 通知 `AegisBlackoutGuard` 服务优雅停止 |
 
 ---
 
